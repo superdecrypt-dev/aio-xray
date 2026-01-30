@@ -769,6 +769,13 @@ function generate_configs() {
         "wsSettings": {
           "path": "$PATH_VLESS_WS_INT"
         }
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+          ]
       }
     },
     {
@@ -789,6 +796,13 @@ function generate_configs() {
         "wsSettings": {
           "path": "$PATH_VMESS_WS_INT"
         }
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+          ]
       }
     },
     {
@@ -809,6 +823,13 @@ function generate_configs() {
         "wsSettings": {
           "path": "$PATH_TROJAN_WS_INT"
         }
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+          ]
       }
     },
     {
@@ -830,6 +851,13 @@ function generate_configs() {
         "httpupgradeSettings": {
           "path": "$PATH_VLESS_HU_INT"
         }
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+          ]
       }
     },
     {
@@ -850,6 +878,13 @@ function generate_configs() {
         "httpupgradeSettings": {
           "path": "$PATH_VMESS_HU_INT"
         }
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+          ]
       }
     },
     {
@@ -870,6 +905,13 @@ function generate_configs() {
         "httpupgradeSettings": {
           "path": "$PATH_TROJAN_HU_INT"
         }
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+          ]
       }
     },
     {
@@ -891,6 +933,13 @@ function generate_configs() {
         "grpcSettings": {
           "serviceName": "$SVC_VLESS_GRPC_INT"
         }
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+          ]
       }
     },
     {
@@ -911,6 +960,13 @@ function generate_configs() {
         "grpcSettings": {
           "serviceName": "$SVC_VMESS_GRPC_INT"
         }
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+          ]
       }
     },
     {
@@ -931,6 +987,13 @@ function generate_configs() {
         "grpcSettings": {
           "serviceName": "$SVC_TROJAN_GRPC_INT"
         }
+      },
+      "sniffing": {
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+          ]
       }
     },
     {
