@@ -122,6 +122,7 @@ menu
 - Backup & restore
 - Restart service & maintenance sistem
 - Monitoring resource dan log server
+- AdGuard Home
 
 ---
 
