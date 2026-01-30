@@ -426,7 +426,7 @@ import re
 import os
 
 NGINX_CONF_PATH = "/etc/nginx/conf.d/xray.conf"
-MAX_LOOPS = 1800  # Monitor selama 30 menit (900 detik)
+MAX_LOOPS = 86400  # Monitor selama 1 Jam (86400 detik)
 
 def get_agh_port():
     try:
