@@ -1,10 +1,4 @@
 # AIO Xray Core + Nginx Auto Installer
-
-All-in-One automation script untuk membangun **server Xray Core siap produksi** dengan konfigurasi yang terstandarisasi, aman, dan mudah dikelola.  
-Dirancang untuk administrator VPS yang membutuhkan **deploy cepat**, **maintenance terpusat**, dan **operasional stabil**.
-
-Mendukung **Ubuntu 20.04+** dan **Debian 11+**.
-
 ---
 
 ## Gambaran Umum
@@ -16,6 +10,10 @@ Repository ini menyediakan dua komponen utama:
 
 - **menu.sh**  
   Menu interaktif berbasis terminal untuk manajemen akun, monitoring trafik, keamanan, dan maintenance server pasca instalasi.
+
+Mendukung **Ubuntu 20.04+** dan **Debian 11+**.
+
+Script ini dikerjakan penuh oleh **Gemini AI** ✨
 
 ---
 
