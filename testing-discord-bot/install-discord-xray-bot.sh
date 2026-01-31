@@ -419,10 +419,16 @@ ExecStart=${BOT_VENV}/bin/python ${BOT_PY}
 Restart=on-failure
 RestartSec=3
 # Hardening
-NoNewPrivileges=true
+NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
+ReadWritePaths=/usr/local/etc/xray
+ReadWritePaths=/opt/quota
+ReadWritePaths=/opt/vless
+ReadWritePaths=/opt/vmess
+ReadWritePaths=/opt/trojan
+ReadWritePaths=/opt/allproto
 
 [Install]
 WantedBy=multi-user.target
