@@ -475,7 +475,7 @@ run_step "1. Optimasi Sistem (BBR, Swap, NTP, Fail2Ban)" system_optimization
 # --- Step 3: Dependencies & Nginx Official ---
 function install_dependencies_nginx() {
     apt update
-    apt install -y curl socat tar unzip zip jq openssl lsb-release gnupg2 ca-certificates ubuntu-keyring
+    apt install -y curl dnsutils socat tar unzip zip jq openssl lsb-release gnupg2 ca-certificates ubuntu-keyring
 
     # Nginx Official Repo Setup
     curl https://nginx.org/keys/nginx_signing.key | gpg --dearmor | tee /usr/share/keyrings/nginx-archive-keyring.gpg

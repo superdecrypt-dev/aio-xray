@@ -179,9 +179,12 @@ function generate_and_save() {
     local created_at=$(date +%Y-%m-%d)
     local expired_at=$(date -d "+${exp} days" +%Y-%m-%d)
     
+    # Quota input: dalam GB (0 = Unlimited)
     local quota_bytes=0
+    local quota_display="Unlimited"
     if [[ -n "$quota" && "$quota" != "0" ]]; then
         quota_bytes=$(($quota * 1073741824))
+        quota_display="${quota} GB"
     fi
 
     # 2. Simpan Metadata ke JSON (/opt/quota/protocol/user.json)
@@ -244,7 +247,7 @@ function generate_and_save() {
 
     local link_trojan_hu="trojan://${uuid}@${DOMAIN}:443?security=tls&type=httpupgrade&path=%2Ftrojan-hu#${user}"
 
-    # 4. Build Output TXT (Tanpa QuotaLines)
+    # 4. Build Output TXT (Tampilkan quota dalam GB)
     local output_text=""
 
     output_text+="==================================================\n"
@@ -254,6 +257,7 @@ function generate_and_save() {
     output_text+="IP         : ${IPVPS}\n"
     output_text+="Username   : ${user}\n"
     output_text+="UUID/Pass  : ${uuid}\n"
+    output_text+="QuotaLimit : ${quota_display}\n"
     output_text+="Expired    : ${exp} Hari\n"
     output_text+="ValidUntil : ${expired_at}\n"
     output_text+="Created    : $(date)\n"
@@ -1332,9 +1336,22 @@ function change_domain_setup() {
                         user=$(grep "Username" "$file" | cut -d: -f2 | tr -d ' ')
                         uuid=$(grep "UUID/Pass" "$file" | cut -d: -f2 | tr -d ' ')
                         exp=$(grep "Expired" "$file" | cut -d: -f2 | awk '{print $1}')
-                        quota_bytes=$(grep "QuotaLimit" "$file" | cut -d: -f2 | tr -d ' ')
+                        # Quota bisa format baru: "10 GB" atau format lama (bytes)
+                        quota_line=$(grep -m1 "^QuotaLimit" "$file" | cut -d: -f2- | xargs)
                         quota_gb="0"
-                        if [[ -n "$quota_bytes" && "$quota_bytes" != "0" ]]; then quota_gb=$(($quota_bytes / 1073741824)); fi
+                        if [[ -n "$quota_line" ]]; then
+                            if echo "$quota_line" | grep -qiE 'unlimited|tanpa|inf|∞'; then
+                                quota_gb="0"
+                            elif echo "$quota_line" | grep -qE '^[0-9]+$'; then
+                                # Legacy: bytes
+                                quota_gb=$(($quota_line / 1073741824))
+                            elif echo "$quota_line" | grep -qiE '^[0-9]+[[:space:]]*gb$'; then
+                                quota_gb=$(echo "$quota_line" | grep -oE '^[0-9]+')
+                            else
+                                tmp_num=$(echo "$quota_line" | grep -oE '^[0-9]+')
+                                if [[ -n "$tmp_num" ]]; then quota_gb="$tmp_num"; fi
+                            fi
+                        fi
                         if [[ -n "$user" && -n "$uuid" ]]; then generate_and_save "$user" "$uuid" "$exp" "$quota_gb" "$type" "$dir" >/dev/null 2>&1; fi
                     fi
                 done
