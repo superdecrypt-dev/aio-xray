@@ -211,18 +211,26 @@ embedded_python_to_temp() {
 # -*- coding: utf-8 -*-
 
 import argparse
+import base64
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 from uuid import uuid4
 
+# -----------------------------
+# Paths / constants
+# -----------------------------
 CONFIG_PATH = Path("/usr/local/etc/xray/config.json")
 NGINX_XRAY_CONF = Path("/etc/nginx/conf.d/xray.conf")
 XRAY_SERVICE = "xray"
@@ -240,18 +248,21 @@ USERNAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 GB_BYTES = Decimal("1073741824")  # 1024^3
 
+# -----------------------------
+# Output helpers
+# -----------------------------
 def eprint(msg: str) -> None:
     print(msg, file=sys.stderr)
 
-def ok(msg: str) -> None:
+def ok_line(msg: str) -> None:
     print(f"[OK] {msg}")
 
-def err(msg: str) -> None:
+def err_line(msg: str) -> None:
     eprint(f"[ERROR] {msg}")
 
 def require_root() -> None:
     if os.geteuid() != 0:
-        err("Script ini harus dijalankan sebagai root.")
+        err_line("Script ini harus dijalankan sebagai root.")
         sys.exit(2)
 
 def ts_compact() -> str:
@@ -263,25 +274,15 @@ def today_str() -> str:
 def add_days_str(days: int) -> str:
     return (date.today() + timedelta(days=days)).strftime("%Y-%m-%d")
 
-def parse_domain_from_nginx_conf() -> str:
-    if not NGINX_XRAY_CONF.exists():
-        return "-"
-    try:
-        for line in NGINX_XRAY_CONF.read_text(encoding="utf-8", errors="ignore").splitlines():
-            m = re.match(r"^\s*server_name\s+([^;]+)\s*;\s*$", line)
-            if m:
-                tokens = m.group(1).strip().split()
-                return tokens[0] if tokens else "-"
-    except Exception:
-        return "-"
-    return "-"
-
+# -----------------------------
+# Safe IO helpers
+# -----------------------------
 def safe_mkdir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
-def atomic_write_text(path: Path, content: str, *, mode: int = None, uid: int = None, gid: int = None) -> None:
+def atomic_write_text(path: Path, content: str, mode: Optional[int] = None) -> None:
     safe_mkdir(path.parent)
-    tmp = None
+    tmp: Optional[Path] = None
     try:
         fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".tmp-", dir=str(path.parent))
         tmp = Path(tmp_name)
@@ -293,12 +294,7 @@ def atomic_write_text(path: Path, content: str, *, mode: int = None, uid: int = 
             os.fsync(f.fileno())
 
         if mode is not None:
-            os.chmod(tmp, mode)
-        if uid is not None and gid is not None:
-            try:
-                os.chown(tmp, uid, gid)
-            except PermissionError:
-                pass
+            os.chmod(str(tmp), mode)
 
         os.replace(str(tmp), str(path))
         tmp = None
@@ -309,67 +305,16 @@ def atomic_write_text(path: Path, content: str, *, mode: int = None, uid: int = 
             except Exception:
                 pass
 
-def atomic_write_json(path: Path, obj, *, indent: int = 2, mode: int = None, uid: int = None, gid: int = None) -> None:
+def atomic_write_json(path: Path, obj: Any, indent: int = 2, mode: Optional[int] = None) -> None:
     content = json.dumps(obj, ensure_ascii=False, indent=indent)
-    atomic_write_text(path, content, mode=mode, uid=uid, gid=gid)
+    atomic_write_text(path, content, mode=mode)
 
-def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
+# -----------------------------
+# System helpers
+# -----------------------------
+def run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
     p = subprocess.run(cmd, capture_output=True, text=True)
     return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
-
-def restart_xray_or_rollback(backup_path: Path) -> None:
-    code, out, er = run_cmd(["systemctl", "restart", XRAY_SERVICE])
-    if code == 0:
-        return
-
-    err_detail = er or out or f"systemctl restart {XRAY_SERVICE} gagal (exit={code})."
-    err(f"Restart xray gagal. Rollback ke backup: {backup_path.name}")
-    try:
-        shutil.copy2(str(backup_path), str(CONFIG_PATH))
-    except Exception as ex:
-        err(f"Rollback copy gagal: {ex}")
-        sys.exit(9)
-
-    code2, out2, er2 = run_cmd(["systemctl", "restart", XRAY_SERVICE])
-    if code2 != 0:
-        err(f"Rollback sukses tapi restart masih gagal. Detail: {(er2 or out2 or '').strip()}")
-        sys.exit(10)
-
-    err(f"Detail restart gagal sebelum rollback: {err_detail}")
-    sys.exit(8)
-
-def load_config_or_restore_latest_backup() -> dict:
-    if not CONFIG_PATH.exists():
-        err(f"Config tidak ditemukan: {CONFIG_PATH}")
-        sys.exit(3)
-
-    raw = CONFIG_PATH.read_text(encoding="utf-8", errors="strict")
-    try:
-        return json.loads(raw)
-    except Exception as ex:
-        err(f"Gagal parse JSON config: {ex}")
-
-        backups = sorted(CONFIG_PATH.parent.glob(CONFIG_PATH.name + ".bak-*"))
-        if not backups:
-            err("Tidak ada backup ditemukan untuk restore. Perbaiki config.json manual.")
-            sys.exit(4)
-
-        latest = backups[-1]
-        corrupt_name = CONFIG_PATH.with_name(CONFIG_PATH.name + f".corrupt-{ts_compact()}")
-        try:
-            shutil.move(str(CONFIG_PATH), str(corrupt_name))
-            shutil.copy2(str(latest), str(CONFIG_PATH))
-            ok(f"Config corrupt dipindah ke: {corrupt_name.name}")
-            ok(f"Restore dari backup terbaru: {latest.name}")
-        except Exception as ex2:
-            err(f"Restore gagal: {ex2}")
-            sys.exit(5)
-
-        try:
-            return json.loads(CONFIG_PATH.read_text(encoding="utf-8", errors="strict"))
-        except Exception as ex3:
-            err(f"Masih gagal parse setelah restore: {ex3}")
-            sys.exit(6)
 
 def backup_config() -> Path:
     ts = ts_compact()
@@ -377,8 +322,8 @@ def backup_config() -> Path:
     shutil.copy2(str(CONFIG_PATH), str(backup))
     return backup
 
-def atomic_save_config(config_obj: dict, st: os.stat_result) -> None:
-    tmp = None
+def atomic_save_config(config_obj: Dict[str, Any], st: os.stat_result) -> None:
+    tmp: Optional[Path] = None
     try:
         safe_mkdir(CONFIG_PATH.parent)
         fd, tmp_name = tempfile.mkstemp(prefix="config.json.tmp-", dir=str(CONFIG_PATH.parent))
@@ -390,9 +335,9 @@ def atomic_save_config(config_obj: dict, st: os.stat_result) -> None:
             f.flush()
             os.fsync(f.fileno())
 
-        os.chmod(tmp, st.st_mode)
+        os.chmod(str(tmp), st.st_mode)
         try:
-            os.chown(tmp, st.st_uid, st.st_gid)
+            os.chown(str(tmp), st.st_uid, st.st_gid)
         except PermissionError:
             pass
 
@@ -405,19 +350,76 @@ def atomic_save_config(config_obj: dict, st: os.stat_result) -> None:
             except Exception:
                 pass
 
+def restart_xray_or_rollback(backup_path: Path) -> None:
+    code, out, er = run_cmd(["systemctl", "restart", XRAY_SERVICE])
+    if code == 0:
+        return
+
+    detail = er or out or f"systemctl restart {XRAY_SERVICE} failed (exit={code})."
+    err_line(f"Restart xray gagal. Rollback ke backup: {backup_path.name}")
+    try:
+        shutil.copy2(str(backup_path), str(CONFIG_PATH))
+    except Exception as ex:
+        err_line(f"Rollback copy gagal: {ex}")
+        sys.exit(9)
+
+    code2, out2, er2 = run_cmd(["systemctl", "restart", XRAY_SERVICE])
+    if code2 != 0:
+        err_line(f"Rollback sukses tapi restart masih gagal. Detail: {(er2 or out2 or '').strip()}")
+        sys.exit(10)
+
+    err_line(f"Detail restart gagal sebelum rollback: {detail}")
+    sys.exit(8)
+
+def load_config_or_restore_latest_backup() -> Dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        err_line(f"Config tidak ditemukan: {CONFIG_PATH}")
+        sys.exit(3)
+
+    raw = CONFIG_PATH.read_text(encoding="utf-8", errors="strict")
+    try:
+        return json.loads(raw)
+    except Exception as ex:
+        err_line(f"Gagal parse JSON config: {ex}")
+
+        backups = sorted(CONFIG_PATH.parent.glob(CONFIG_PATH.name + ".bak-*"))
+        if not backups:
+            err_line("Tidak ada backup ditemukan untuk restore. Perbaiki config.json manual.")
+            sys.exit(4)
+
+        latest = backups[-1]
+        corrupt_name = CONFIG_PATH.with_name(CONFIG_PATH.name + f".corrupt-{ts_compact()}")
+        try:
+            shutil.move(str(CONFIG_PATH), str(corrupt_name))
+            shutil.copy2(str(latest), str(CONFIG_PATH))
+            ok_line(f"Config corrupt dipindah ke: {corrupt_name.name}")
+            ok_line(f"Restore dari backup terbaru: {latest.name}")
+        except Exception as ex2:
+            err_line(f"Restore gagal: {ex2}")
+            sys.exit(5)
+
+        try:
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8", errors="strict"))
+        except Exception as ex3:
+            err_line(f"Masih gagal parse setelah restore: {ex3}")
+            sys.exit(6)
+
+# -----------------------------
+# Validation helpers
+# -----------------------------
 def normalize_mode(mode: str) -> str:
-    mode = (mode or "").strip().lower()
-    if mode not in VALID_MODES:
-        err(f"Mode tidak valid: {mode}. Pilih: allproto|vless|vmess|trojan")
+    m = (mode or "").strip().lower()
+    if m not in VALID_MODES:
+        err_line(f"Mode tidak valid: {m}. Pilih: allproto|vless|vmess|trojan")
         sys.exit(2)
-    return mode
+    return m
 
 def validate_username(username: str) -> str:
     if not username:
-        err("Username kosong.")
+        err_line("Username kosong.")
         sys.exit(2)
     if not USERNAME_RE.match(username):
-        err("Username invalid. Hanya boleh [a-zA-Z0-9_].")
+        err_line("Username invalid. Hanya boleh [a-zA-Z0-9_].")
         sys.exit(2)
     return username
 
@@ -428,35 +430,50 @@ def parse_days(days_s: str) -> int:
     try:
         days = int(days_s)
     except ValueError:
-        err("days harus integer.")
+        err_line("days harus integer.")
         sys.exit(2)
     if days <= 0:
-        err("days harus > 0.")
+        err_line("days harus > 0.")
+        sys.exit(2)
+    if days > 3650:
+        err_line("days terlalu besar (maks 3650).")
         sys.exit(2)
     return days
 
-def parse_quota_gb(quota_s: str) -> int:
+def parse_quota_gb(quota_s: str) -> Tuple[int, str]:
+    """
+    Returns (quota_bytes, quota_gb_display_input)
+    """
     try:
         q = Decimal(str(quota_s))
     except (InvalidOperation, ValueError):
-        err("quota_gb harus angka (contoh: 0, 10, 25.5).")
+        err_line("quota_gb harus angka (contoh: 0, 10, 25.5).")
         sys.exit(2)
 
     if q < 0:
-        err("quota_gb tidak boleh negatif.")
+        err_line("quota_gb tidak boleh negatif.")
         sys.exit(2)
+
+    # Preserve original-like display
     if q == 0:
-        return 0
+        return 0, "0"
+
+    # normalize display string (avoid scientific)
+    q_display = format(q.normalize(), "f") if q == q.to_integral() else str(q)
+
     b = int((q * GB_BYTES).to_integral_value(rounding="ROUND_HALF_UP"))
     if b < 0:
         b = 0
-    return b
+    return b, q_display
 
-def iter_all_client_entries(config_obj: dict):
+# -----------------------------
+# Xray config manipulation
+# -----------------------------
+def iter_all_client_entries(config_obj: Dict[str, Any]):
     inbounds = config_obj.get("inbounds", [])
     if not isinstance(inbounds, list):
         return
-    for i, inbound in enumerate(inbounds):
+    for inbound in inbounds:
         if not isinstance(inbound, dict):
             continue
         settings = inbound.get("settings")
@@ -465,17 +482,17 @@ def iter_all_client_entries(config_obj: dict):
         clients = settings.get("clients")
         if not isinstance(clients, list):
             continue
-        for j, c in enumerate(clients):
+        for c in clients:
             if isinstance(c, dict):
-                yield i, clients, j, c
+                yield c
 
-def email_exists_anywhere(config_obj: dict, email: str) -> bool:
-    for _, _, _, c in iter_all_client_entries(config_obj):
+def email_exists_anywhere(config_obj: Dict[str, Any], email: str) -> bool:
+    for c in iter_all_client_entries(config_obj):
         if c.get("email") == email:
             return True
     return False
 
-def append_user_to_protocol_inbounds(config_obj: dict, protocol: str, email: str, cred: str) -> int:
+def append_user_to_protocol_inbounds(config_obj: Dict[str, Any], protocol: str, email: str, cred: str) -> int:
     appended = 0
     inbounds = config_obj.get("inbounds", [])
     if not isinstance(inbounds, list):
@@ -489,6 +506,7 @@ def append_user_to_protocol_inbounds(config_obj: dict, protocol: str, email: str
         settings = inbound.get("settings")
         if not isinstance(settings, dict):
             continue
+
         clients = settings.get("clients")
         if clients is None:
             settings["clients"] = []
@@ -505,7 +523,7 @@ def append_user_to_protocol_inbounds(config_obj: dict, protocol: str, email: str
 
     return appended
 
-def remove_user_from_protocol_inbounds(config_obj: dict, protocol: str, email: str) -> int:
+def remove_user_from_protocol_inbounds(config_obj: Dict[str, Any], protocol: str, email: str) -> int:
     removed = 0
     inbounds = config_obj.get("inbounds", [])
     if not isinstance(inbounds, list):
@@ -529,7 +547,234 @@ def remove_user_from_protocol_inbounds(config_obj: dict, protocol: str, email: s
 
     return removed
 
-def build_metadata(final_username: str, protocol: str, quota_bytes: int, expired_at: str) -> dict:
+# -----------------------------
+# Domain/IP + link generation
+# -----------------------------
+def read_domain_from_nginx_conf() -> str:
+    if not NGINX_XRAY_CONF.exists():
+        return "-"
+    try:
+        for line in NGINX_XRAY_CONF.read_text(encoding="utf-8", errors="ignore").splitlines():
+            m = re.match(r"^\s*server_name\s+([^;]+)\s*;\s*$", line)
+            if m:
+                tokens = m.group(1).strip().split()
+                return tokens[0] if tokens else "-"
+    except Exception:
+        pass
+    return "-"
+
+def public_ip() -> str:
+    # Try several services; fallback local route IP
+    urls = [
+        "https://api.ipify.org",
+        "https://checkip.amazonaws.com",
+        "https://ifconfig.me/ip",
+    ]
+    for u in urls:
+        try:
+            req = Request(u, headers={"User-Agent": "curl/8"})
+            with urlopen(req, timeout=5) as r:
+                ip = r.read().decode().strip()
+                if ip and re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
+                    return ip
+        except Exception:
+            continue
+
+    # fallback local
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "0.0.0.0"
+
+def quota_display_gb(quota_bytes: int, quota_gb_input: str) -> str:
+    if quota_bytes <= 0:
+        return "Unlimited"
+    # prefer input display
+    if quota_gb_input:
+        # if integer like "1", show "1 GB"
+        return f"{quota_gb_input} GB"
+    gb = float(quota_bytes) / 1073741824.0
+    if abs(gb - round(gb)) < 1e-9:
+        return f"{int(round(gb))} GB"
+    return f"{gb:.2f} GB"
+
+def created_str() -> str:
+    # similar shape to your sample, timezone depends on server
+    return datetime.now().astimezone().strftime("%a %b %d %H:%M:%S %Z %Y")
+
+def _normalize_path(p: str) -> str:
+    if not p:
+        return "/"
+    return p if p.startswith("/") else ("/" + p)
+
+def discover_transport_params(config_obj: Dict[str, Any], protocol: str) -> Dict[str, str]:
+    """
+    Read streamSettings from inbounds to discover ws/httpupgrade paths and grpc serviceName.
+    Returns:
+      {"ws_path": "/xxx", "hu_path": "/yyy", "grpc_service": "name"}
+    If not found, fallback defaults:
+      ws_path: /<proto>-ws
+      hu_path: /<proto>-hu
+      grpc_service: <proto>-grpc
+    """
+    ws_path: Optional[str] = None
+    hu_path: Optional[str] = None
+    grpc_service: Optional[str] = None
+
+    inbounds = config_obj.get("inbounds", [])
+    if isinstance(inbounds, list):
+        for inbound in inbounds:
+            if not isinstance(inbound, dict):
+                continue
+            if inbound.get("protocol") != protocol:
+                continue
+            ss = inbound.get("streamSettings")
+            if not isinstance(ss, dict):
+                continue
+            net = ss.get("network")
+
+            if net == "ws" and ws_path is None:
+                ws = ss.get("wsSettings")
+                if isinstance(ws, dict):
+                    ws_path = ws.get("path")
+            elif net == "httpupgrade" and hu_path is None:
+                hu = ss.get("httpupgradeSettings")
+                if isinstance(hu, dict):
+                    hu_path = hu.get("path")
+            elif net == "grpc" and grpc_service is None:
+                g = ss.get("grpcSettings")
+                if isinstance(g, dict):
+                    grpc_service = g.get("serviceName")
+
+            if ws_path and hu_path and grpc_service:
+                break
+
+    # fallback defaults
+    if not ws_path:
+        ws_path = f"/{protocol}-ws"
+    if not hu_path:
+        hu_path = f"/{protocol}-hu"
+    if not grpc_service:
+        grpc_service = f"{protocol}-grpc"
+
+    return {
+        "ws_path": _normalize_path(str(ws_path)),
+        "hu_path": _normalize_path(str(hu_path)),
+        "grpc_service": str(grpc_service),
+    }
+
+def build_vless_links(domain: str, uuid: str, user: str, params: Dict[str, str]) -> Dict[str, str]:
+    ws_path = quote(params["ws_path"], safe="")  # encode '/' -> %2F
+    hu_path = quote(params["hu_path"], safe="")
+    grpc_service = quote(params["grpc_service"], safe="")
+
+    return {
+        "WebSocket": f"vless://{uuid}@{domain}:443?security=tls&encryption=none&type=ws&path={ws_path}#{user}",
+        "HTTPUpgrade": f"vless://{uuid}@{domain}:443?security=tls&encryption=none&type=httpupgrade&path={hu_path}#{user}",
+        "gRPC": f"vless://{uuid}@{domain}:443?security=tls&encryption=none&type=grpc&serviceName={grpc_service}&mode=gun#{user}",
+    }
+
+def build_trojan_links(domain: str, password: str, user: str, params: Dict[str, str]) -> Dict[str, str]:
+    ws_path = quote(params["ws_path"], safe="")
+    hu_path = quote(params["hu_path"], safe="")
+    grpc_service = quote(params["grpc_service"], safe="")
+
+    return {
+        "WebSocket": f"trojan://{password}@{domain}:443?security=tls&type=ws&path={ws_path}#{user}",
+        "HTTPUpgrade": f"trojan://{password}@{domain}:443?security=tls&type=httpupgrade&path={hu_path}#{user}",
+        "gRPC": f"trojan://{password}@{domain}:443?security=tls&type=grpc&serviceName={grpc_service}&mode=gun#{user}",
+    }
+
+def build_vmess_link(domain: str, uuid: str, user: str, net: str, path_or_service: str, extra_type: str) -> str:
+    # v2rayN-like JSON
+    obj = {
+        "v": "2",
+        "ps": user,
+        "add": domain,
+        "port": "443",
+        "id": uuid,
+        "aid": "0",
+        "scy": "auto",
+        "net": net,
+        "type": extra_type,
+        "host": domain,
+        "path": path_or_service,
+        "tls": "tls",
+        "sni": domain,
+    }
+    raw = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return "vmess://" + base64.b64encode(raw).decode("utf-8")
+
+def build_vmess_links(domain: str, uuid: str, user: str, params: Dict[str, str]) -> Dict[str, str]:
+    ws_path_raw = params["ws_path"]
+    hu_path_raw = params["hu_path"]
+    grpc_service_raw = params["grpc_service"]
+
+    return {
+        "WebSocket": build_vmess_link(domain, uuid, user, "ws", ws_path_raw, "none"),
+        "HTTPUpgrade": build_vmess_link(domain, uuid, user, "httpupgrade", hu_path_raw, "none"),
+        "gRPC": build_vmess_link(domain, uuid, user, "grpc", grpc_service_raw, "gun"),
+    }
+
+def render_account_detail(
+    mode: str,
+    domain: str,
+    ip: str,
+    final_username: str,
+    secret: str,
+    days: int,
+    expired_at: str,
+    quota_bytes: int,
+    quota_gb_input: str,
+    config_obj: Dict[str, Any],
+) -> str:
+    created = created_str()
+    qdisp = quota_display_gb(quota_bytes, quota_gb_input)
+
+    lines: List[str] = []
+    lines.append("==================================================")
+    lines.append(f"           XRAY ACCOUNT DETAIL ({mode})")
+    lines.append("==================================================")
+    lines.append(f"Domain     : {domain}")
+    lines.append(f"IP         : {ip}")
+    lines.append(f"Username   : {final_username}")
+    lines.append(f"UUID/Pass  : {secret}")
+    lines.append(f"QuotaLimit : {qdisp}")
+    lines.append(f"Expired    : {days} Hari")
+    lines.append(f"ValidUntil : {expired_at}")
+    lines.append(f"Created    : {created}")
+    lines.append("==================================================")
+
+    def section(title: str, kv: Dict[str, str]) -> None:
+        lines.append(f"[{title}]")
+        lines.append(f"WebSocket  : {kv['WebSocket']}")
+        lines.append(f"HTTPUpgrade: {kv['HTTPUpgrade']}")
+        lines.append(f"gRPC       : {kv['gRPC']}")
+        lines.append("--------------------------------------------------")
+
+    if mode in ("vless", "allproto"):
+        params = discover_transport_params(config_obj, "vless")
+        section("VLESS", build_vless_links(domain, secret, final_username, params))
+
+    if mode in ("vmess", "allproto"):
+        params = discover_transport_params(config_obj, "vmess")
+        section("VMESS", build_vmess_links(domain, secret, final_username, params))
+
+    if mode in ("trojan", "allproto"):
+        params = discover_transport_params(config_obj, "trojan")
+        section("TROJAN", build_trojan_links(domain, secret, final_username, params))
+
+    lines.append("==================================================")
+    return "\n".join(lines)
+
+# -----------------------------
+# Metadata/TXT
+# -----------------------------
+def build_metadata(final_username: str, protocol: str, quota_bytes: int, expired_at: str) -> Dict[str, Any]:
     return {
         "username": final_username,
         "protocol": protocol,
@@ -538,8 +783,31 @@ def build_metadata(final_username: str, protocol: str, quota_bytes: int, expired
         "expired_at": expired_at,
     }
 
-def write_metadata_and_txt(mode: str, final_username: str, cred: str, expired_at: str, quota_bytes: int) -> None:
-    domain = parse_domain_from_nginx_conf()
+def write_metadata_and_txt(
+    mode: str,
+    final_username: str,
+    secret: str,
+    expired_at: str,
+    quota_bytes: int,
+    quota_gb_input: str,
+    days: int,
+    config_obj: Dict[str, Any],
+) -> None:
+    domain = read_domain_from_nginx_conf()
+    ip = public_ip()
+
+    detail_text = render_account_detail(
+        mode=mode,
+        domain=domain,
+        ip=ip,
+        final_username=final_username,
+        secret=secret,
+        days=days,
+        expired_at=expired_at,
+        quota_bytes=quota_bytes,
+        quota_gb_input=quota_gb_input,
+        config_obj=config_obj,
+    )
 
     def write_one(proto: str) -> None:
         meta_dir = QUOTA_BASE / proto
@@ -550,20 +818,18 @@ def write_metadata_and_txt(mode: str, final_username: str, cred: str, expired_at
         txt_dir = TXT_BASE_MAP[proto]
         safe_mkdir(txt_dir)
         txt_path = txt_dir / f"{final_username}.txt"
-        label = "UUID" if proto in ("vless", "vmess", "allproto") else "Pass"
-        txt = (
-            f"Domain: {domain}\n"
-            f"Username: {final_username}\n"
-            f"{label}: {cred}\n"
-            f"Expired: {expired_at}\n"
-        )
-        atomic_write_text(txt_path, txt)
+
+        # Store the same detailed block (closest to your desired output)
+        atomic_write_text(txt_path, detail_text)
 
     if mode == "allproto":
         for p in ("vless", "vmess", "trojan", "allproto"):
             write_one(p)
     else:
         write_one(mode)
+
+    # Also print the detail to stdout (so Discord bot shows it)
+    print(detail_text)
 
 def delete_metadata_and_txt(mode: str, final_username: str) -> None:
     def rm_one(proto: str) -> None:
@@ -580,58 +846,76 @@ def delete_metadata_and_txt(mode: str, final_username: str) -> None:
     else:
         rm_one(mode)
 
+# -----------------------------
+# Commands
+# -----------------------------
 def cmd_add(args: argparse.Namespace) -> int:
     mode = normalize_mode(args.mode)
     username = validate_username(args.username)
     days = parse_days(args.days)
-    quota_bytes = parse_quota_gb(args.quota_gb)
+    quota_bytes, quota_gb_input = parse_quota_gb(args.quota_gb)
 
     fuser = final_user(mode, username)
 
     config_obj = load_config_or_restore_latest_backup()
-    st = os.stat(CONFIG_PATH)
+    st = os.stat(str(CONFIG_PATH))
 
+    # Duplicate check
     if email_exists_anywhere(config_obj, fuser):
-        err(f"Duplikasi: email sudah ada di config.json: {fuser}")
+        err_line(f"Duplikasi: email sudah ada di config.json: {fuser}")
         return 7
 
-    cred = str(uuid4())
-    expired_at = (date.today() + timedelta(days=days)).strftime("%Y-%m-%d")
+    secret = str(uuid4())
+    expired_at = add_days_str(days)
 
     backup = backup_config()
 
+    # Apply modifications
     if mode == "allproto":
-        n1 = append_user_to_protocol_inbounds(config_obj, "vless", fuser, cred)
-        n2 = append_user_to_protocol_inbounds(config_obj, "vmess", fuser, cred)
-        n3 = append_user_to_protocol_inbounds(config_obj, "trojan", fuser, cred)
-        appended = n1 + n2 + n3
-        if appended == 0:
-            err("Tidak menemukan inbound vless/vmess/trojan dengan settings.clients untuk ditambahkan.")
-            err(f"Backup tersedia: {backup}")
+        n_vless = append_user_to_protocol_inbounds(config_obj, "vless", fuser, secret)
+        n_vmess = append_user_to_protocol_inbounds(config_obj, "vmess", fuser, secret)
+        n_trojan = append_user_to_protocol_inbounds(config_obj, "trojan", fuser, secret)
+
+        # strict: require each protocol to be present at least once
+        if n_vless == 0 or n_vmess == 0 or n_trojan == 0:
+            err_line("Mode allproto membutuhkan inbound vless + vmess + trojan untuk ditambahkan.")
+            err_line(f"Append result: vless={n_vless}, vmess={n_vmess}, trojan={n_trojan}")
+            err_line(f"Backup tersedia: {backup}")
             return 11
     else:
-        appended = append_user_to_protocol_inbounds(config_obj, mode, fuser, cred)
+        appended = append_user_to_protocol_inbounds(config_obj, mode, fuser, secret)
         if appended == 0:
-            err(f"Tidak menemukan inbound protocol={mode} dengan settings.clients untuk ditambahkan.")
-            err(f"Backup tersedia: {backup}")
+            err_line(f"Tidak menemukan inbound protocol={mode} dengan settings.clients untuk ditambahkan.")
+            err_line(f"Backup tersedia: {backup}")
             return 11
 
+    # Save config atomically
     try:
         atomic_save_config(config_obj, st)
     except Exception as ex:
-        err(f"Gagal menulis config secara atomic: {ex}")
-        err(f"Restore dari backup: {backup}")
+        err_line(f"Gagal menulis config secara atomic: {ex}")
+        err_line(f"Restore dari backup: {backup}")
         try:
             shutil.copy2(str(backup), str(CONFIG_PATH))
         except Exception:
             pass
         return 12
 
+    # Write metadata + TXT + print detail (if fails, rollback config)
     try:
-        write_metadata_and_txt(mode, fuser, cred, expired_at, quota_bytes)
+        write_metadata_and_txt(
+            mode=mode,
+            final_username=fuser,
+            secret=secret,
+            expired_at=expired_at,
+            quota_bytes=quota_bytes,
+            quota_gb_input=quota_gb_input,
+            days=days,
+            config_obj=config_obj,
+        )
     except Exception as ex:
-        err(f"Gagal membuat metadata/txt: {ex}")
-        err("Rollback config karena metadata gagal.")
+        err_line(f"Gagal membuat metadata/txt/output: {ex}")
+        err_line("Rollback config karena metadata gagal.")
         try:
             shutil.copy2(str(backup), str(CONFIG_PATH))
             run_cmd(["systemctl", "restart", XRAY_SERVICE])
@@ -639,25 +923,11 @@ def cmd_add(args: argparse.Namespace) -> int:
             pass
         return 13
 
-    code, out, er = run_cmd(["systemctl", "restart", XRAY_SERVICE])
-    if code != 0:
-        err_detail = er or out or f"systemctl restart {XRAY_SERVICE} gagal (exit={code})."
-        err(f"Restart xray gagal. Rollback ke backup: {backup.name}")
-        try:
-            shutil.copy2(str(backup), str(CONFIG_PATH))
-            run_cmd(["systemctl", "restart", XRAY_SERVICE])
-        except Exception:
-            pass
-        err(f"Detail: {err_detail}")
-        return 8
+    # Restart xray (rollback if restart fails)
+    restart_xray_or_rollback(backup)
 
-    cred_label = "UUID" if mode in ("vless", "vmess", "allproto") else "PASS"
-    ok(f"Add user sukses: {fuser}")
-    ok(f"{cred_label}: {cred}")
-    ok(f"Expired: {expired_at}")
-    ok(f"Quota bytes: {quota_bytes} (0=unlimited)")
-    ok(f"Config backup: {backup.name}")
-    ok("Xray restarted.")
+    # keep a short OK line for clarity (Discord will show it above banner)
+    ok_line(f"Add user sukses: {fuser} | backup={backup.name}")
     return 0
 
 def cmd_del(args: argparse.Namespace) -> int:
@@ -666,7 +936,7 @@ def cmd_del(args: argparse.Namespace) -> int:
     fuser = final_user(mode, username)
 
     config_obj = load_config_or_restore_latest_backup()
-    st = os.stat(CONFIG_PATH)
+    st = os.stat(str(CONFIG_PATH))
 
     backup = backup_config()
 
@@ -679,26 +949,28 @@ def cmd_del(args: argparse.Namespace) -> int:
         removed_total = remove_user_from_protocol_inbounds(config_obj, mode, fuser)
 
     if removed_total == 0:
-        err(f"User tidak ditemukan di config.json: {fuser} (mode={mode})")
-        err(f"Backup dibuat: {backup.name} (tidak ada perubahan yang disimpan)")
+        err_line(f"User tidak ditemukan di config.json: {fuser} (mode={mode})")
+        err_line(f"Backup dibuat: {backup.name} (tidak ada perubahan yang disimpan)")
         return 14
 
+    # Save config atomically
     try:
         atomic_save_config(config_obj, st)
     except Exception as ex:
-        err(f"Gagal menulis config secara atomic: {ex}")
-        err(f"Restore dari backup: {backup}")
+        err_line(f"Gagal menulis config secara atomic: {ex}")
+        err_line(f"Restore dari backup: {backup}")
         try:
             shutil.copy2(str(backup), str(CONFIG_PATH))
         except Exception:
             pass
         return 12
 
+    # Delete metadata/TXT (rollback if fails)
     try:
         delete_metadata_and_txt(mode, fuser)
     except Exception as ex:
-        err(f"Gagal hapus metadata/txt: {ex}")
-        err("Rollback config karena cleanup metadata gagal.")
+        err_line(f"Gagal hapus metadata/txt: {ex}")
+        err_line("Rollback config karena cleanup metadata gagal.")
         try:
             shutil.copy2(str(backup), str(CONFIG_PATH))
             run_cmd(["systemctl", "restart", XRAY_SERVICE])
@@ -706,24 +978,15 @@ def cmd_del(args: argparse.Namespace) -> int:
             pass
         return 15
 
-    code, out, er = run_cmd(["systemctl", "restart", XRAY_SERVICE])
-    if code != 0:
-        err_detail = er or out or f"systemctl restart {XRAY_SERVICE} gagal (exit={code})."
-        err(f"Restart xray gagal. Rollback ke backup: {backup.name}")
-        try:
-            shutil.copy2(str(backup), str(CONFIG_PATH))
-            run_cmd(["systemctl", "restart", XRAY_SERVICE])
-        except Exception:
-            pass
-        err(f"Detail: {err_detail}")
-        return 8
+    # Restart xray (rollback if fails)
+    restart_xray_or_rollback(backup)
 
-    ok(f"Del user sukses: {fuser}")
-    ok(f"Removed entries: {removed_total}")
-    ok(f"Config backup: {backup.name}")
-    ok("Xray restarted.")
+    ok_line(f"Del user sukses: {fuser} | removed_entries={removed_total} | backup={backup.name}")
     return 0
 
+# -----------------------------
+# CLI
+# -----------------------------
 def build_parser() -> argparse.ArgumentParser:
     ep = (
         "Contoh:\n"
@@ -733,7 +996,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p = argparse.ArgumentParser(
         prog="xray-userctl",
-        description="Xray user add/del (edit config.json + metadata quota) — standalone script.",
+        description="Xray user add/del (edit config.json + metadata quota + pretty output + import links).",
         epilog=ep,
         formatter_class=argparse.RawTextHelpFormatter,
     )
@@ -756,6 +1019,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     require_root()
     parser = build_parser()
+
     if len(sys.argv) < 2:
         parser.print_help()
         return 2
