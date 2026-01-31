@@ -6,5 +6,5 @@ sebelum ingin mencoba ini, harus install autoscript ini ```https://github.com/su
 
 
 ```
-wget https://raw.githubusercontent.com/superdecrypt-dev/aio-xray/refs/heads/main/testing-discord-bot/install-xray-userctl.sh && wget https://raw.githubusercontent.com/superdecrypt-dev/aio-xray/master/testing-discord-bot/install-discord-xray-bot.sh
+wget https://raw.githubusercontent.com/superdecrypt-dev/aio-xray/master/testing-discord-bot/install-xray-userctl.sh && wget https://raw.githubusercontent.com/superdecrypt-dev/aio-xray/master/testing-discord-bot/install-discord-xray-bot.sh
 ```
