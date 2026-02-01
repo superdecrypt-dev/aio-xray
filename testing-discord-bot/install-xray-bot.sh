@@ -320,7 +320,14 @@ npm_bin_for_bot(){
 install_bot_deps(){
   info "Installing Node dependencies in ${BOT_DIR} (as ${BOT_USER})..."
   chown -R "${BOT_USER}:${BOT_USER}" "${BOT_DIR}"
-  su - "${BOT_USER}" -c "bash -lc 'cd \"${BOT_DIR}\" && npm install --omit=dev'"
+
+  su - "${BOT_USER}" -c "bash -lc '
+    export NVM_DIR=\"\$HOME/.nvm\"
+    [ -s \"\$NVM_DIR/nvm.sh\" ] && . \"\$NVM_DIR/nvm.sh\"
+    command -v npm >/dev/null 2>&1 || { echo \"[ERROR] npm still not found in bot user env\"; exit 1; }
+    cd \"${BOT_DIR}\"
+    npm install --omit=dev
+  '"
   ok "Node dependencies installed"
 }
 
