@@ -376,10 +376,26 @@ def restart_xray() -> Tuple[int, str]:
     msg = er or out or ""
     return code, msg
 
+def ensure_xray_service_exists() -> None:
+    if not shutil_which("systemctl"):
+        err("systemctl not found. Requires systemd.")
+        sys.exit(5)
+    code, out, er = run_cmd(["systemctl", "status", XRAY_SERVICE])
+    if code != 0 and "Loaded:" not in (out + "\n" + er):
+        # Still might be okay, but generally means service missing
+        warn("Cannot confirm xray service status cleanly (systemctl status nonzero). Continuing...")
+
+def shutil_which(cmd: str) -> bool:
+    return any((Path(p) / cmd).exists() for p in os.environ.get("PATH", "").split(":"))
+
 # ==========================
 # DELETE LEGACY BACKUPS
 # ==========================
 def delete_legacy_backups() -> None:
+    """
+    User request:
+    1) hapus config.json.bak-* , tidak lagi menggunakan backup tersebut.
+    """
     try:
         pattern = CONFIG_PATH.name + ".bak-*"
         backups = list(CONFIG_PATH.parent.glob(pattern))
@@ -433,6 +449,9 @@ def parse_days(days_s: str) -> int:
     return days
 
 def parse_quota_gb(quota_s: str) -> Tuple[int, str]:
+    """
+    Returns: (quota_bytes, quota_gb_display_input)
+    """
     try:
         q = Decimal(str(quota_s))
     except (InvalidOperation, ValueError):
@@ -446,6 +465,7 @@ def parse_quota_gb(quota_s: str) -> Tuple[int, str]:
     if q == 0:
         return 0, "0"
 
+    # preserve user-ish display
     q_display = format(q.normalize(), "f") if q == q.to_integral() else str(q)
     b = int((q * GB_BYTES).to_integral_value(rounding="ROUND_HALF_UP"))
     return b, q_display
@@ -560,6 +580,7 @@ def public_ip() -> str:
                     return ip
         except Exception:
             continue
+    # fallback local
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -737,20 +758,28 @@ def write_metadata(mode: str, final_username: str, quota_bytes: int, expired_at:
         atomic_write_json(p, build_metadata(final_username, proto, quota_bytes, expired_at), mode=0o644)
 
     if mode == "allproto":
+        # tetap buat metadata per-proto + allproto (untuk kompatibilitas sistem kamu)
         for proto in ("vless", "vmess", "trojan", "allproto"):
             write_one(proto)
     else:
         write_one(mode)
 
 def write_detail_txt(mode: str, final_username: str, detail: str) -> Path:
-    # user request: allproto ONLY saved under /opt/allproto
-    base = TXT_BASE_MAP["allproto"] if mode == "allproto" else TXT_BASE_MAP[mode]
+    # sesuai request:
+    # - output sekarang berupa file .txt
+    # - allproto hanya simpan 1 file di /opt/allproto
+    if mode == "allproto":
+        base = TXT_BASE_MAP["allproto"]
+    else:
+        base = TXT_BASE_MAP[mode]
+
     safe_mkdir(base, 0o755)
     p = base / f"{final_username}.txt"
     atomic_write_text(p, detail, mode=0o644)
     return p
 
 def delete_metadata_and_txt(mode: str, final_username: str) -> None:
+    # delete metadata
     def rm_file(p: Path) -> None:
         if p.exists():
             try:
@@ -759,10 +788,11 @@ def delete_metadata_and_txt(mode: str, final_username: str) -> None:
                 pass
 
     if mode == "allproto":
+        # metadata all four
         for proto in ("vless", "vmess", "trojan", "allproto"):
             rm_file(QUOTA_DIRS[proto] / f"{final_username}.json")
 
-        # txt only allproto (also clean possible legacy files)
+        # txt hanya allproto (tapi bersihkan legacy jika ada)
         rm_file(TXT_BASE_MAP["allproto"] / f"{final_username}.txt")
         rm_file(TXT_BASE_MAP["vless"] / f"{final_username}.txt")
         rm_file(TXT_BASE_MAP["vmess"] / f"{final_username}.txt")
@@ -775,7 +805,7 @@ def delete_metadata_and_txt(mode: str, final_username: str) -> None:
 # COMMANDS
 # ==========================
 def cmd_add(args: argparse.Namespace) -> int:
-    delete_legacy_backups()
+    delete_legacy_backups()  # request #1: remove old .bak files if any
 
     mode = normalize_mode(args.mode)
     username = validate_username(args.username)
@@ -784,10 +814,12 @@ def cmd_add(args: argparse.Namespace) -> int:
 
     fuser = final_user(mode, username)
 
+    # Read original config bytes (in-memory rollback; no .bak files)
     raw_before = read_config_bytes()
     config_obj = load_config_from_bytes(raw_before)
     st = os.stat(str(CONFIG_PATH))
 
+    # Duplicate check
     if email_exists_anywhere(config_obj, fuser):
         err(f"Duplikasi: email sudah ada di config.json: {fuser}")
         return 7
@@ -795,6 +827,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     secret = str(uuid4())
     expired_at = (date.today() + timedelta(days=days)).strftime("%Y-%m-%d")
 
+    # Mutate config
     if mode == "allproto":
         n1 = append_user_to_protocol(config_obj, "vless", fuser, secret)
         n2 = append_user_to_protocol(config_obj, "vmess", fuser, secret)
@@ -809,16 +842,19 @@ def cmd_add(args: argparse.Namespace) -> int:
             err(f"Tidak menemukan inbound protocol={mode} dengan settings.clients untuk ditambahkan.")
             return 11
 
+    # Save config atomically
     try:
         save_config_atomically(config_obj, st)
     except Exception as ex:
         err(f"Gagal menulis config secara atomic: {ex}")
+        # rollback to original bytes (best effort)
         try:
             atomic_write_bytes(CONFIG_PATH, raw_before, mode=st.st_mode, uid=st.st_uid, gid=st.st_gid)
         except Exception:
             pass
         return 12
 
+    # Restart xray; if fail -> rollback to original config and restart again
     code, msg = restart_xray()
     if code != 0:
         err(f"Restart xray gagal: {msg or f'exit={code}'}")
@@ -830,6 +866,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             pass
         return 8
 
+    # Build detail text, write metadata + txt
     try:
         detail = render_detail(mode, config_obj, fuser, secret, days, expired_at, quota_bytes, quota_gb_input)
         write_metadata(mode, fuser, quota_bytes, expired_at)
@@ -844,12 +881,13 @@ def cmd_add(args: argparse.Namespace) -> int:
             pass
         return 13
 
+    # Output minimal + inform path file (bot akan attach file)
     ok(f"Add user sukses: {fuser}")
     ok(f"OUTPUT_FILE: {txt_path}")
     return 0
 
 def cmd_del(args: argparse.Namespace) -> int:
-    delete_legacy_backups()
+    delete_legacy_backups()  # request #1
 
     mode = normalize_mode(args.mode)
     username = validate_username(args.username)
@@ -892,6 +930,7 @@ def cmd_del(args: argparse.Namespace) -> int:
             pass
         return 8
 
+    # Cleanup metadata/txt
     try:
         delete_metadata_and_txt(mode, fuser)
     except Exception as ex:
@@ -912,7 +951,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p = argparse.ArgumentParser(
         prog="xray-userctl",
-        description="Xray user add/del (NO config.json.bak-*, atomic writes, ADD outputs .txt file path).",
+        description="Xray user add/del (NO config.json.bak-*, atomic config writes, output as .txt file).",
         epilog=ep,
         formatter_class=argparse.RawTextHelpFormatter,
     )
