@@ -1186,11 +1186,11 @@ server {
 
     # --- Section 3: Handle gRPC ---
     location ~ ^/(vless|vmess|trojan)-grpc {
-        rewrite ^ /$grpc_service_name/Tun break;
-        grpc_pass grpc://127.0.0.1:$internal_port;
-        grpc_set_header Host $host;
-        grpc_set_header X-Real-IP $remote_addr;
-        grpc_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        rewrite ^ /\$grpc_service_name/Tun break;
+        grpc_pass grpc://127.0.0.1:\$internal_port;
+        grpc_set_header Host \$host;
+        grpc_set_header X-Real-IP \$remote_addr;
+        grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
 }
 EOF
