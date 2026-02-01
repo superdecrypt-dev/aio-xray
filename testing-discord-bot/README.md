@@ -11,7 +11,7 @@ jika sudah install script yang diatas selanjutnya install script dibawah ini, ba
 - APPLICATION ID
 
 ```
-wget -O /root/install-xray-bot.sh https://raw.githubusercontent.com/superdecrypt-dev/aio-xray/master/testing-discord-bot/install-xray-bot.sh && chmod +x install-xray-bot.sh && ./install-xray-bot.sh
+rm -rf install-xray-bot.sh && wget -O /root/install-xray-bot.sh https://raw.githubusercontent.com/superdecrypt-dev/aio-xray/master/testing-discord-bot/install-xray-bot.sh && chmod +x install-xray-bot.sh && ./install-xray-bot.sh
 ```
 fitur saat ini yang berfungsi dengan baik
 - tambah user
