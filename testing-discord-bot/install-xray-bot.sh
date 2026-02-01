@@ -529,8 +529,6 @@ menu(){
     echo "=============================="
     echo " XRAY DISCORD BOT INSTALLER"
     echo "=============================="
-    echo "RAW base: ${DEFAULT_RAW_BASE_URL}"
-    echo "------------------------------"
     echo "1) Install / Update (deploy + service + run)"
     echo "2) Reconfigure (Discord creds / RAW base URL)"
     echo "3) Restart service"
