@@ -1186,10 +1186,11 @@ server {
 
     # --- Section 3: Handle gRPC ---
     location ~ ^/(vless|vmess|trojan)-grpc {
-        rewrite ^ /[\$grpc_service_name]/Tun break;
-        grpc_pass grpc://127.0.0.1:\$internal_port;
-        grpc_set_header X-Real-IP \$remote_addr;
-        grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        rewrite ^ /$grpc_service_name/Tun break;
+        grpc_pass grpc://127.0.0.1:$internal_port;
+        grpc_set_header Host $host;
+        grpc_set_header X-Real-IP $remote_addr;
+        grpc_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 }
 EOF
@@ -1619,6 +1620,20 @@ EOF
     systemctl daemon-reload
     systemctl enable --now xray-quota.service
 
+    cat >/usr/local/bin/xray-update-geodata <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+TMP_FILE="$(mktemp)"
+trap 'rm -f "$TMP_FILE"' EXIT
+
+curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$TMP_FILE"
+bash "$TMP_FILE" @ install-geodata
+systemctl restart xray
+EOF
+
+    chmod +x /usr/local/bin/xray-update-geodata
+
     # 6. Add Crons (Expiry, Limit, Watchdog, Geo)
     (
         crontab -l 2>/dev/null
@@ -1632,9 +1647,9 @@ EOF
         crontab -l 2>/dev/null
         echo "*/5 * * * * /usr/local/bin/xray-watchdog"
     ) | crontab -
-    (
+    ( 
         crontab -l 2>/dev/null
-        echo "0 4 * * * bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install-geodata && systemctl restart xray"
+        echo "0 4 * * * /usr/local/bin/xray-update-geodata >/dev/null 2>&1"
     ) | crontab -
     
     # 7. Traffic Monitor (Python Version - Xray API)
