@@ -70,8 +70,18 @@ def _save_config_with_backup(cfg: Dict[str, Any]) -> str:
         # best effort backup
         pass
 
+    # ✅ Preserve original permission/owner/group of CONFIG
+    if CONFIG.exists():
+        st = CONFIG.stat()
+        mode = st.st_mode & 0o777
+        uid = st.st_uid
+        gid = st.st_gid
+    else:
+        # reasonable default if somehow missing
+        mode, uid, gid = 0o644, 0, 0
+
     data = (json.dumps(cfg, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-    _atomic_write(CONFIG, data, mode=0o600, uid=0, gid=0)
+    _atomic_write(CONFIG, data, mode=mode, uid=uid, gid=gid)
     return str(ROLLING_BACKUP)
 
 def _restart_xray() -> None:
