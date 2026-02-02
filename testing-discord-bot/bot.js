@@ -26,7 +26,7 @@ const BACKEND_TIMEOUT_MS = 8000;
 // For /ping & /status: try direct reply first to avoid ephemeral editReply rendering glitch on mobile
 const QUICK_REPLY_MS = 1200;
 
-const ACCOUNTS_PAGE_SIZE = 25; // Discord select menu max options
+const PAGE_SIZE = 25; // Discord select menu max options
 
 if (!TOKEN || !GUILD_ID || !ADMIN_ROLE_ID || !CLIENT_ID) {
   console.error("Missing env vars: DISCORD_BOT_TOKEN / DISCORD_GUILD_ID / DISCORD_ADMIN_ROLE_ID / DISCORD_CLIENT_ID");
@@ -55,6 +55,13 @@ function badge(state) {
   if (state === "inactive") return "🔴 inactive";
   if (state === "failed") return "🔴 failed";
   return `⚪ ${state || "unknown"}`;
+}
+
+function clampInt(n, min, max) {
+  n = Number.isFinite(n) ? Math.trunc(n) : min;
+  if (n < min) return min;
+  if (n > max) return max;
+  return n;
 }
 
 function callBackend(req) {
@@ -132,13 +139,16 @@ function lightValidate(protocol, username, days, quota_gb) {
   return { ok: true, protocol };
 }
 
-function buildDetailTxtPath(proto, finalEmail) {
-  const m = /^([A-Za-z0-9_]+)@(vless|vmess|trojan|allproto)$/.exec(finalEmail || "");
+function parseFinalEmail(finalEmail) {
+  const m = /^([A-Za-z0-9_]+)@(vless|vmess|trojan|allproto)$/.exec(String(finalEmail || "").trim());
   if (!m) return null;
+  return { base: m[1], proto: m[2], final: `${m[1]}@${m[2]}` };
+}
 
-  const suffix = m[2];
-  if (suffix !== proto) return null;
-
+function buildDetailTxtPath(proto, finalEmail) {
+  const p = parseFinalEmail(finalEmail);
+  if (!p) return null;
+  if (p.proto !== proto) return null;
   const baseDir = proto === "allproto" ? "/opt/allproto" : `/opt/${proto}`;
   return path.join(baseDir, `${finalEmail}.txt`);
 }
@@ -153,7 +163,6 @@ function buildPingPayload(wsMs, ipcMs) {
     )
     .setFooter({ text: "Latency = round-trip IPC ke backend." });
 
-  // Important: include plain content summary to avoid “embed sometimes fades/vanishes” on mobile
   const content =
     `🏓 Pong\n` +
     `Discord WS: ${wsMs} ms\n` +
@@ -184,13 +193,6 @@ function buildStatusPayload(xrayState, nginxState, ipcMs) {
   return { content, embeds: [embed], ephemeral: true };
 }
 
-function clampInt(n, min, max) {
-  n = Number.isFinite(n) ? Math.trunc(n) : min;
-  if (n < min) return min;
-  if (n > max) return max;
-  return n;
-}
-
 function formatAccountsTable(items) {
   const header = "No  Username                 Type     Expired";
   const lines = [header];
@@ -205,7 +207,8 @@ function formatAccountsTable(items) {
   return "```\n" + lines.join("\n") + "\n```";
 }
 
-async function buildAccountsMessage(protoFilter, offset) {
+async function buildListMessage(kind, protoFilter, offset) {
+  // kind: "acct" or "del"
   protoFilter = String(protoFilter || "all").toLowerCase().trim();
   offset = clampInt(Number(offset || 0), 0, 10_000_000);
 
@@ -213,7 +216,7 @@ async function buildAccountsMessage(protoFilter, offset) {
     action: "list",
     protocol: protoFilter,
     offset,
-    limit: ACCOUNTS_PAGE_SIZE
+    limit: PAGE_SIZE
   });
 
   if (!resp || resp.status !== "ok") {
@@ -229,25 +232,30 @@ async function buildAccountsMessage(protoFilter, offset) {
   const total = Number.isFinite(resp.total) ? resp.total : items.length;
   const hasMore = !!resp.has_more;
 
+  const title = kind === "del" ? "🗑️ Delete Accounts" : "📚 XRAY Accounts";
+  const desc = items.length ? formatAccountsTable(items) : "Tidak ada akun ditemukan.";
+
   const embed = new EmbedBuilder()
-    .setTitle("📚 XRAY Accounts")
-    .setDescription(items.length ? formatAccountsTable(items) : "Tidak ada akun ditemukan.")
+    .setTitle(title)
+    .setDescription(desc)
     .setFooter({ text: `Filter: ${protoFilter} | Showing ${items.length} of ${total} | Offset ${offset}` });
+
+  const prefix = kind === "del" ? "del" : "acct";
 
   const nav = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`acct:prev:${protoFilter}:${offset}`)
+      .setCustomId(`${prefix}:prev:${protoFilter}:${offset}`)
       .setLabel("Prev")
       .setStyle(ButtonStyle.Secondary)
       .setEmoji("⬅️")
       .setDisabled(offset <= 0),
     new ButtonBuilder()
-      .setCustomId(`acct:ref:${protoFilter}:${offset}`)
+      .setCustomId(`${prefix}:ref:${protoFilter}:${offset}`)
       .setLabel("Refresh")
       .setStyle(ButtonStyle.Secondary)
       .setEmoji("🔄"),
     new ButtonBuilder()
-      .setCustomId(`acct:next:${protoFilter}:${offset}`)
+      .setCustomId(`${prefix}:next:${protoFilter}:${offset}`)
       .setLabel("Next")
       .setStyle(ButtonStyle.Secondary)
       .setEmoji("➡️")
@@ -257,11 +265,15 @@ async function buildAccountsMessage(protoFilter, offset) {
   const components = [nav];
 
   if (items.length > 0) {
+    const placeholder = kind === "del"
+      ? "Pilih akun yang ingin dihapus..."
+      : "Pilih akun untuk ambil ulang XRAY ACCOUNT DETAIL (.txt)";
+
     const menu = new StringSelectMenuBuilder()
-      .setCustomId(`acct:sel:${protoFilter}:${offset}`)
-      .setPlaceholder("Pilih akun untuk ambil ulang XRAY ACCOUNT DETAIL (.txt)")
+      .setCustomId(`${prefix}:sel:${protoFilter}:${offset}`)
+      .setPlaceholder(placeholder)
       .addOptions(
-        items.slice(0, ACCOUNTS_PAGE_SIZE).map((it, idx) => {
+        items.slice(0, PAGE_SIZE).map((it, idx) => {
           const u = String(it.username || "-");
           const p = String(it.protocol || "-");
           const e = String(it.expired_at || "-");
@@ -276,10 +288,9 @@ async function buildAccountsMessage(protoFilter, offset) {
     components.unshift(new ActionRowBuilder().addComponents(menu));
   }
 
-  // Include plain content to avoid mobile rendering issues
-  const content = items.length
-    ? `📚 XRAY Accounts — pilih akun dari dropdown untuk ambil ulang file .txt`
-    : `📚 XRAY Accounts — tidak ada akun ditemukan.`;
+  const content = kind === "del"
+    ? (items.length ? "🗑️ Delete mode — pilih akun dari dropdown, lalu konfirmasi." : "🗑️ Delete mode — tidak ada akun.")
+    : (items.length ? "📚 XRAY Accounts — pilih dari dropdown untuk ambil ulang file .txt" : "📚 XRAY Accounts — tidak ada akun.");
 
   return { content, embeds: [embed], components, ephemeral: true };
 }
@@ -289,6 +300,7 @@ async function registerCommands() {
     new SlashCommandBuilder().setName("help").setDescription("Cara pakai bot & penjelasan fungsi"),
     new SlashCommandBuilder().setName("ping").setDescription("Health check bot + backend latency (ms)"),
     new SlashCommandBuilder().setName("status").setDescription("Status service Xray dan Nginx (admin only)"),
+
     new SlashCommandBuilder()
       .setName("accounts")
       .setDescription("List akun + ambil ulang XRAY ACCOUNT DETAIL (.txt) (admin only)")
@@ -310,6 +322,7 @@ async function registerCommands() {
           .setRequired(false)
           .setMinValue(1)
       ),
+
     new SlashCommandBuilder()
       .setName("add")
       .setDescription("Create Xray user (via Python backend)")
@@ -317,11 +330,36 @@ async function registerCommands() {
       .addStringOption(o => o.setName("username").setDescription("username tanpa suffix [a-zA-Z0-9_]").setRequired(true))
       .addIntegerOption(o => o.setName("days").setDescription("masa aktif (hari)").setRequired(true))
       .addNumberOption(o => o.setName("quota_gb").setDescription("quota (GB), 0=unlimited").setRequired(true)),
+
+    // /del: bisa dua mode
+    // - Mode A (interactive): tanpa username => tampil list + pilih + confirm
+    // - Mode B (direct): protocol+username => confirm seperti sebelumnya
     new SlashCommandBuilder()
       .setName("del")
-      .setDescription("Delete Xray user (via Python backend) + confirm button")
-      .addStringOption(o => o.setName("protocol").setDescription("vless/vmess/trojan/allproto").setRequired(true))
-      .addStringOption(o => o.setName("username").setDescription("username tanpa suffix [a-zA-Z0-9_]").setRequired(true)),
+      .setDescription("Delete Xray user (list & confirm) (admin only)")
+      .addStringOption(o =>
+        o.setName("protocol")
+          .setDescription("Filter protocol untuk list, atau protocol untuk delete langsung")
+          .setRequired(false)
+          .addChoices(
+            { name: "all", value: "all" },
+            { name: "vless", value: "vless" },
+            { name: "vmess", value: "vmess" },
+            { name: "trojan", value: "trojan" },
+            { name: "allproto", value: "allproto" },
+          )
+      )
+      .addStringOption(o =>
+        o.setName("username")
+          .setDescription("Jika diisi, bot akan minta confirm delete untuk user ini (tanpa suffix)")
+          .setRequired(false)
+      )
+      .addIntegerOption(o =>
+        o.setName("page")
+          .setDescription("Halaman list (1=awal)")
+          .setRequired(false)
+          .setMinValue(1)
+      ),
   ].map(c => c.toJSON());
 
   const rest = new REST({ version: "10" }).setToken(TOKEN);
@@ -349,42 +387,70 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       const customId = String(interaction.customId || "");
-      if (!customId.startsWith("acct:sel:")) {
-        return interaction.reply({ content: "❌ Unknown menu", ephemeral: true });
+
+      // accounts select: acct:sel:<protoFilter>:<offset>
+      if (customId.startsWith("acct:sel:")) {
+        const selected = (interaction.values && interaction.values[0]) ? String(interaction.values[0]) : "";
+        const parsed = parseFinalEmail(selected);
+        if (!parsed) return interaction.reply({ content: "❌ Invalid target", ephemeral: true });
+
+        const txtPath = buildDetailTxtPath(parsed.proto, parsed.final);
+        if (!txtPath) return interaction.reply({ content: "❌ Invalid target", ephemeral: true });
+
+        await interaction.deferReply({ ephemeral: true });
+
+        if (!fs.existsSync(txtPath)) {
+          return interaction.editReply(`❌ File not found: ${txtPath}`);
+        }
+
+        const file = new AttachmentBuilder(txtPath, { name: path.basename(txtPath) });
+        const embed = new EmbedBuilder()
+          .setTitle("📄 XRAY ACCOUNT DETAIL")
+          .addFields(
+            { name: "Protocol", value: parsed.proto, inline: true },
+            { name: "Username", value: parsed.final, inline: true }
+          )
+          .setFooter({ text: "Attached: XRAY ACCOUNT DETAIL (.txt)" });
+
+        return interaction.editReply({ content: "✅ Detail attached.", embeds: [embed], files: [file] });
       }
 
-      const selected = (interaction.values && interaction.values[0]) ? String(interaction.values[0]) : "";
-      if (!selected || selected === "-") {
-        return interaction.reply({ content: "❌ Invalid selection", ephemeral: true });
+      // delete select: del:sel:<protoFilter>:<offset>
+      if (customId.startsWith("del:sel:")) {
+        const selected = (interaction.values && interaction.values[0]) ? String(interaction.values[0]) : "";
+        const parsed = parseFinalEmail(selected);
+        if (!parsed) return interaction.reply({ content: "❌ Invalid target", ephemeral: true });
+
+        // Reuse existing confirm button format: delconfirm:<proto>:<baseUser>
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`delconfirm:${parsed.proto}:${parsed.base}`)
+            .setLabel("Confirm Delete")
+            .setStyle(ButtonStyle.Danger),
+          new ButtonBuilder()
+            .setCustomId(`delcancel:${parsed.proto}:${parsed.base}`)
+            .setLabel("Cancel")
+            .setStyle(ButtonStyle.Secondary),
+        );
+
+        const embed = new EmbedBuilder()
+          .setTitle("⚠️ Confirm Delete")
+          .setDescription("Klik **Confirm Delete** untuk menghapus akun ini.")
+          .addFields(
+            { name: "Protocol", value: parsed.proto, inline: true },
+            { name: "Username", value: parsed.final, inline: true },
+          )
+          .setFooter({ text: "Ini akan menghapus user dari config + metadata files." });
+
+        // Use update (replace list UI with confirm UI)
+        return interaction.update({
+          content: `⚠️ Confirm delete: ${parsed.final}`,
+          embeds: [embed],
+          components: [row]
+        });
       }
 
-      const m = /^([A-Za-z0-9_]+)@(vless|vmess|trojan|allproto)$/.exec(selected);
-      if (!m) {
-        return interaction.reply({ content: "❌ Invalid target", ephemeral: true });
-      }
-
-      const proto = m[2];
-      const txtPath = buildDetailTxtPath(proto, selected);
-      if (!txtPath) {
-        return interaction.reply({ content: "❌ Invalid target", ephemeral: true });
-      }
-
-      await interaction.deferReply({ ephemeral: true });
-
-      if (!fs.existsSync(txtPath)) {
-        return interaction.editReply(`❌ File not found: ${txtPath}`);
-      }
-
-      const file = new AttachmentBuilder(txtPath, { name: path.basename(txtPath) });
-      const embed = new EmbedBuilder()
-        .setTitle("📄 XRAY ACCOUNT DETAIL")
-        .addFields(
-          { name: "Protocol", value: proto, inline: true },
-          { name: "Username", value: selected, inline: true }
-        )
-        .setFooter({ text: "Attached: XRAY ACCOUNT DETAIL (.txt)" });
-
-      return interaction.editReply({ content: "✅ Detail attached.", embeds: [embed], files: [file] });
+      return interaction.reply({ content: "❌ Unknown menu", ephemeral: true });
     } catch (e) {
       console.error(e);
       const msg = mapBackendError(e);
@@ -407,23 +473,26 @@ client.on("interactionCreate", async (interaction) => {
 
       const customId = String(interaction.customId || "");
 
-      // accounts paging buttons: acct:<prev|ref|next>:<protoFilter>:<offset>
-      if (customId.startsWith("acct:")) {
+      // paging buttons for accounts/delete lists
+      // acct:<prev|ref|next>:<protoFilter>:<offset>
+      // del:<prev|ref|next>:<protoFilter>:<offset>
+      if (customId.startsWith("acct:") || customId.startsWith("del:")) {
         const parts = customId.split(":");
         if (parts.length !== 4) return interaction.reply({ content: "❌ Invalid button", ephemeral: true });
 
+        const prefix = parts[0]; // acct|del
         const kind = String(parts[1] || "").trim();
         const protoFilter = String(parts[2] || "all").toLowerCase().trim();
         const offset = clampInt(parseInt(parts[3], 10), 0, 10_000_000);
 
         let nextOffset = offset;
-        if (kind === "next") nextOffset = offset + ACCOUNTS_PAGE_SIZE;
-        else if (kind === "prev") nextOffset = Math.max(0, offset - ACCOUNTS_PAGE_SIZE);
+        if (kind === "next") nextOffset = offset + PAGE_SIZE;
+        else if (kind === "prev") nextOffset = Math.max(0, offset - PAGE_SIZE);
         else if (kind === "ref") nextOffset = offset;
         else return interaction.reply({ content: "❌ Invalid button", ephemeral: true });
 
         await interaction.deferUpdate();
-        const payload = await buildAccountsMessage(protoFilter, nextOffset);
+        const payload = await buildListMessage(prefix === "del" ? "del" : "acct", protoFilter, nextOffset);
 
         return interaction.editReply({
           content: payload.content,
@@ -494,7 +563,7 @@ client.on("interactionCreate", async (interaction) => {
           )
           .setFooter({ text: "User removed from config and metadata cleaned." });
 
-        return interaction.editReply({ embeds: [embed], components: [] });
+        return interaction.editReply({ content: "✅ Deleted.", embeds: [embed], components: [] });
       }
 
       return interaction.reply({ content: "❌ Unknown button", ephemeral: true });
@@ -520,10 +589,10 @@ client.on("interactionCreate", async (interaction) => {
       .setDescription("Bot ini untuk manajemen akun Xray via backend service (IPC).")
       .addFields(
         { name: "/add", value: "Membuat akun Xray + mengirim detail (.txt). **Admin only**", inline: false },
-        { name: "/del", value: "Menghapus akun Xray (dengan tombol konfirmasi). **Admin only**", inline: false },
+        { name: "/del", value: "Hapus akun via list+pilih+confirm. Atau isi protocol+username untuk confirm langsung. **Admin only**", inline: false },
+        { name: "/accounts", value: "List akun (paging) + pilih untuk ambil ulang detail (.txt). **Admin only**", inline: false },
         { name: "/ping", value: "Cek bot hidup + latency backend (ms).", inline: false },
         { name: "/status", value: "Lihat status service Xray & Nginx. **Admin only**", inline: false },
-        { name: "/accounts", value: "Menampilkan daftar akun (paging) + pilih untuk ambil ulang detail (.txt). **Admin only**", inline: false },
         { name: "Aturan username", value: "`[A-Za-z0-9_]` (tanpa suffix). Bot akan menambahkan `@vless/@vmess/@trojan/@allproto`.", inline: false },
         { name: "Quota", value: "`quota_gb=0` berarti Unlimited.", inline: false }
       )
@@ -539,7 +608,6 @@ client.on("interactionCreate", async (interaction) => {
       const t0 = Date.now();
       const work = callBackend({ action: "ping" });
 
-      // Try to finish quickly to avoid defer+edit (mobile glitch)
       const quick = await Promise.race([
         work.then((r) => ({ ok: true, r })),
         new Promise((res) => setTimeout(() => res(null), QUICK_REPLY_MS)),
@@ -547,15 +615,13 @@ client.on("interactionCreate", async (interaction) => {
 
       if (quick) {
         if (!quick.ok || quick.r.status !== "ok") {
-          const err = quick && quick.ok === false ? quick.e : null;
-          const msg = err ? mapBackendError(err) : (quick.r.error || "unknown error");
+          const msg = quick.r && quick.r.error ? quick.r.error : "unknown error";
           return interaction.reply({ content: `❌ Backend ping failed: ${msg}`, ephemeral: true });
         }
         const ipcMs = Date.now() - t0;
         return interaction.reply(buildPingPayload(wsMs, ipcMs));
       }
 
-      // Fallback: defer then edit
       await interaction.deferReply({ ephemeral: true });
       const resp = await work;
       if (resp.status !== "ok") {
@@ -567,7 +633,6 @@ client.on("interactionCreate", async (interaction) => {
     } catch (e) {
       console.error(e);
       const msg = mapBackendError(e);
-      // safe reply/edit depending on state
       if (interaction.deferred) return interaction.editReply(`❌ ${msg}`);
       return interaction.reply({ content: `❌ ${msg}`, ephemeral: true });
     }
@@ -591,15 +656,13 @@ client.on("interactionCreate", async (interaction) => {
 
       if (quick) {
         if (!quick.ok || quick.r.status !== "ok") {
-          const err = quick && quick.ok === false ? quick.e : null;
-          const msg = err ? mapBackendError(err) : (quick.r.error || "unknown error");
+          const msg = quick.r && quick.r.error ? quick.r.error : "unknown error";
           return interaction.reply({ content: `❌ Failed: ${msg}`, ephemeral: true });
         }
         const ipcMs = Date.now() - t0;
         return interaction.reply(buildStatusPayload(quick.r.xray, quick.r.nginx, ipcMs));
       }
 
-      // Fallback: defer then edit
       await interaction.deferReply({ ephemeral: true });
       const resp = await work;
       if (resp.status !== "ok") {
@@ -621,10 +684,11 @@ client.on("interactionCreate", async (interaction) => {
     try {
       const protoFilter = String(interaction.options.getString("protocol") || "all").toLowerCase().trim();
       const page = interaction.options.getInteger("page") || 1;
-      const offset = Math.max(0, (page - 1) * ACCOUNTS_PAGE_SIZE);
+      const offset = Math.max(0, (page - 1) * PAGE_SIZE);
 
       await interaction.deferReply({ ephemeral: true });
-      const payload = await buildAccountsMessage(protoFilter, offset);
+      const payload = await buildListMessage("acct", protoFilter, offset);
+
       return interaction.editReply({
         content: payload.content,
         embeds: payload.embeds,
@@ -684,7 +748,6 @@ client.on("interactionCreate", async (interaction) => {
           .setStyle(ButtonStyle.Secondary)
       );
 
-      // Include content fallback to avoid embed rendering issues on mobile
       const content =
         `✅ Created\n` +
         `Protocol: ${v.protocol}\n` +
@@ -702,35 +765,67 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 
-  // /del (admin-only) with confirm
+  // /del (admin-only) — two modes
   if (cmd === "del") {
-    const protocol = interaction.options.getString("protocol");
-    const username = interaction.options.getString("username");
+    const protocolOpt = interaction.options.getString("protocol"); // may be null
+    const usernameOpt = interaction.options.getString("username"); // may be null
+    const page = interaction.options.getInteger("page") || 1;
 
-    const v = lightValidate(protocol, username);
-    if (!v.ok) return interaction.reply({ content: `❌ ${v.msg}`, ephemeral: true });
+    // Mode B: direct confirm if BOTH protocol+username provided (old behavior preserved)
+    if (protocolOpt && usernameOpt) {
+      const protocol = String(protocolOpt).toLowerCase().trim();
+      const username = String(usernameOpt).trim();
 
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`delconfirm:${v.protocol}:${username}`)
-        .setLabel("Confirm Delete")
-        .setStyle(ButtonStyle.Danger),
-      new ButtonBuilder()
-        .setCustomId(`delcancel:${v.protocol}:${username}`)
-        .setLabel("Cancel")
-        .setStyle(ButtonStyle.Secondary),
-    );
+      const v = lightValidate(protocol, username);
+      if (!v.ok) return interaction.reply({ content: `❌ ${v.msg}`, ephemeral: true });
 
-    const embed = new EmbedBuilder()
-      .setTitle("⚠️ Confirm Delete")
-      .setDescription("Klik **Confirm Delete** untuk menghapus akun ini.")
-      .addFields(
-        { name: "Protocol", value: v.protocol, inline: true },
-        { name: "Username", value: `${username}@${v.protocol}`, inline: true },
-      )
-      .setFooter({ text: "Ini akan menghapus user dari config + metadata files." });
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`delconfirm:${v.protocol}:${username}`)
+          .setLabel("Confirm Delete")
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId(`delcancel:${v.protocol}:${username}`)
+          .setLabel("Cancel")
+          .setStyle(ButtonStyle.Secondary),
+      );
 
-    return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+      const embed = new EmbedBuilder()
+        .setTitle("⚠️ Confirm Delete")
+        .setDescription("Klik **Confirm Delete** untuk menghapus akun ini.")
+        .addFields(
+          { name: "Protocol", value: v.protocol, inline: true },
+          { name: "Username", value: `${username}@${v.protocol}`, inline: true },
+        )
+        .setFooter({ text: "Ini akan menghapus user dari config + metadata files." });
+
+      return interaction.reply({ content: "⚠️ Confirm delete", embeds: [embed], components: [row], ephemeral: true });
+    }
+
+    // If username provided but protocol missing => error (keep strict)
+    if (!protocolOpt && usernameOpt) {
+      return interaction.reply({ content: "❌ Jika ingin delete langsung, isi juga option protocol. Atau jalankan /del tanpa username untuk mode list.", ephemeral: true });
+    }
+
+    // Mode A: interactive list (default)
+    try {
+      const protoFilter = String(protocolOpt || "all").toLowerCase().trim();
+      const offset = Math.max(0, (page - 1) * PAGE_SIZE);
+
+      await interaction.deferReply({ ephemeral: true });
+      const payload = await buildListMessage("del", protoFilter, offset);
+
+      return interaction.editReply({
+        content: payload.content,
+        embeds: payload.embeds,
+        components: payload.components
+      });
+    } catch (e) {
+      console.error(e);
+      const msg = mapBackendError(e);
+      if (interaction.deferred) return interaction.editReply(`❌ ${msg}`);
+      return interaction.reply({ content: `❌ ${msg}`, ephemeral: true });
+    }
   }
 
   return interaction.reply({ content: "❌ Unknown command", ephemeral: true });
