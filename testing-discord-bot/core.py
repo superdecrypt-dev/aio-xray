@@ -196,14 +196,67 @@ def _read_domain_from_nginx_conf() -> str:
         pass
     return "unknown"
 
+def _read_public_port_from_nginx_conf(default: int = 443) -> int:
+    """
+    Ambil port publik dari /etc/nginx/conf.d/xray.conf dengan parse directive 'listen'.
+    Fallback ke 443 jika tidak ditemukan.
+    Contoh yang didukung:
+      listen 443 ssl;
+      listen [::]:443 ssl;
+      listen 0.0.0.0:443 ssl http2;
+    """
+    conf = Path("/etc/nginx/conf.d/xray.conf")
+    if not conf.exists():
+        return default
+
+    try:
+        txt = conf.read_text(encoding="utf-8", errors="ignore")
+        # cari semua "listen ...;"
+        listens = re.findall(r"^\s*listen\s+([^;]+);", txt, flags=re.M)
+        for l in listens:
+            s = l.strip()
+
+            # buang token non-port yang umum muncul
+            # contoh: "443 ssl http2" / "[::]:443 ssl" / "0.0.0.0:443 ssl"
+            # cari port setelah ":" dulu (ipv6/ipv4 bind)
+            m = re.search(r":(\d{2,5})\b", s)
+            if m:
+                port = int(m.group(1))
+                if 1 <= port <= 65535:
+                    return port
+
+            # kalau tidak ada ":" ambil token angka pertama
+            m2 = re.search(r"\b(\d{2,5})\b", s)
+            if m2:
+                port = int(m2.group(1))
+                if 1 <= port <= 65535:
+                    return port
+    except Exception:
+        pass
+
+    return default
+
 def _get_ip() -> str:
-    # first IP from hostname -I
+    # public IP from ifconfig.me
+    try:
+        out = subprocess.check_output(
+            ["curl", "-s", "--max-time", "5", "ifconfig.me"],
+            text=True
+        ).strip()
+        # validasi sederhana IPv4/IPv6
+        if out and len(out) <= 64:
+            return out
+    except Exception:
+        pass
+
+    # fallback (kalau curl gagal)
     try:
         out = subprocess.check_output(["bash", "-lc", "hostname -I | awk '{print $1}'"], text=True).strip()
         if out:
             return out
     except Exception:
         pass
+
     return "unknown"
 
 def _fmt_quota_gb(quota_gb: float) -> str:
@@ -306,77 +359,75 @@ def _collect_inbounds(cfg: Dict[str, Any], proto: str):
         res.append((port, network, security, stream))
     return res
 
-def _build_links_for_vless(domain: str, email: str, uuid: str, items):
+def _build_links_for_vless(domain: str, email: str, uuid: str, items, public_port: int):
     links = []
     def add(label, link):
         links.append(f"{label:10}: {link}")
 
+    # kalau items kosong, fallback minimal
     if not items:
-        # fallback minimal
-        add("WebSocket", f"vless://{uuid}@{domain}:443?security=tls&encryption=none&type=ws&path=%2F#"+quote(email))
+        add("WebSocket", f"vless://{uuid}@{domain}:{public_port}?security=tls&encryption=none&type=ws&path=%2F#" + quote(email))
         return links
 
     seen = set()
-    for port, network, security, stream in items:
-        port = port if isinstance(port, int) else 443
+    for _port, network, security, stream in items:
+        port = public_port  # ✅ force public port
         ws = stream.get("wsSettings", {}) if isinstance(stream.get("wsSettings"), dict) else {}
         grpc = stream.get("grpcSettings", {}) if isinstance(stream.get("grpcSettings"), dict) else {}
         http = stream.get("httpSettings", {}) if isinstance(stream.get("httpSettings"), dict) else {}
 
         if network == "ws":
-            path = ws.get("path", "/")
-            key = ("ws", port, path, security)
-            if key in seen: 
+            path_ = ws.get("path", "/")
+            key = ("ws", port, path_, security)
+            if key in seen:
                 continue
             seen.add(key)
-            add("WebSocket", f"vless://{uuid}@{domain}:{port}?security={security}&encryption=none&type=ws&path={quote(path)}#"+quote(email))
+            add("WebSocket", f"vless://{uuid}@{domain}:{port}?security={security}&encryption=none&type=ws&path={quote(path_)}#" + quote(email))
 
         elif network == "grpc":
             sn = grpc.get("serviceName", "grpc")
             key = ("grpc", port, sn, security)
-            if key in seen: 
-                continue
-            seen.add(key)
-            add("gRPC", f"vless://{uuid}@{domain}:{port}?security={security}&encryption=none&type=grpc&serviceName={quote(sn)}&mode=gun#"+quote(email))
-
-        elif network == "httpupgrade":
-            path = http.get("path", "/")
-            key = ("httpupgrade", port, path, security)
             if key in seen:
                 continue
             seen.add(key)
-            add("HTTPUpgrade", f"vless://{uuid}@{domain}:{port}?security={security}&encryption=none&type=httpupgrade&path={quote(path)}#"+quote(email))
+            add("gRPC", f"vless://{uuid}@{domain}:{port}?security={security}&encryption=none&type=grpc&serviceName={quote(sn)}&mode=gun#" + quote(email))
+
+        elif network == "httpupgrade":
+            path_ = http.get("path", "/")
+            key = ("httpupgrade", port, path_, security)
+            if key in seen:
+                continue
+            seen.add(key)
+            add("HTTPUpgrade", f"vless://{uuid}@{domain}:{port}?security={security}&encryption=none&type=httpupgrade&path={quote(path_)}#" + quote(email))
 
         else:
             key = ("tcp", port, security)
             if key in seen:
                 continue
             seen.add(key)
-            add("TCP", f"vless://{uuid}@{domain}:{port}?security={security}&encryption=none&type=tcp#"+quote(email))
+            add("TCP", f"vless://{uuid}@{domain}:{port}?security={security}&encryption=none&type=tcp#" + quote(email))
 
     return links
 
-def _build_links_for_trojan(domain: str, email: str, pwd: str, items):
+def _build_links_for_trojan(domain: str, email: str, pwd: str, items, public_port: int):
     links = []
     def add(label, link):
         links.append(f"{label:10}: {link}")
 
-    # trojan links are less standardized; provide common trojan-tls
-    add("TLS", f"trojan://{pwd}@{domain}:443?security=tls&type=tcp#"+quote(email))
+    add("TLS", f"trojan://{pwd}@{domain}:{public_port}?security=tls&type=tcp#" + quote(email))
     return links
 
-def _build_links_for_vmess(domain: str, email: str, uuid: str, items):
+def _build_links_for_vmess(domain: str, email: str, uuid: str, items, public_port: int):
     links = []
     def add(label, link):
         links.append(f"{label:10}: {link}")
 
     if not items:
-        # minimal fallback using WS 443
         obj = {
             "v": "2",
             "ps": email,
             "add": domain,
-            "port": "443",
+            "port": str(public_port),  # ✅ public port
             "id": uuid,
             "aid": "0",
             "net": "ws",
@@ -390,8 +441,8 @@ def _build_links_for_vmess(domain: str, email: str, uuid: str, items):
         return links
 
     seen = set()
-    for port, network, security, stream in items:
-        port = port if isinstance(port, int) else 443
+    for _port, network, security, stream in items:
+        port = public_port  # ✅ force public port
         ws = stream.get("wsSettings", {}) if isinstance(stream.get("wsSettings"), dict) else {}
         grpc = stream.get("grpcSettings", {}) if isinstance(stream.get("grpcSettings"), dict) else {}
         http = stream.get("httpSettings", {}) if isinstance(stream.get("httpSettings"), dict) else {}
@@ -513,81 +564,95 @@ def _write_detail(proto: str, final_u: str, secret: str, days: int, quota_gb: fl
     p.write_text(json.dumps(detail, indent=2) + "\n", encoding="utf-8")
     return str(p)
 
-def _write_detail_txt(cfg: Dict[str, Any], proto: str, final_u: str, secret: str, days: int, quota_gb: float) -> str:
+def _write_detail_txt(cfg: Dict[str, Any], proto: str, final_user: str, secret: str, days: int, quota_gb: float) -> str:
+    # ✅ Domain dari nginx xray.conf
+    domain = _read_domain_from_nginx_conf()
+
+    # ✅ Public IP dari ifconfig.me (fallback ke _get_ip())
+    ipaddr = "unknown"
+    try:
+        out = subprocess.check_output(
+            ["curl", "-s", "--max-time", "5", "ifconfig.me"],
+            text=True
+        ).strip()
+        if out and len(out) <= 64 and (" " not in out) and ("\n" not in out) and ("\r" not in out):
+            ipaddr = out
+    except Exception:
+        pass
+
+    if ipaddr == "unknown":
+        try:
+            ipaddr = _get_ip()
+        except Exception:
+            ipaddr = "unknown"
+
+    # ✅ Public port dari nginx xray.conf (default 443)
+    public_port = _read_public_port_from_nginx_conf(443)
+
+    valid_until = (date.today() + timedelta(days=days)).isoformat()
+
+    # created (tetap gaya lama)
+    try:
+        created = datetime.now().strftime("%a %b %d %H:%M:%S %Z %Y").strip()
+        if not created:
+            created = datetime.now().strftime("%a %b %d %H:%M:%S %Y")
+    except Exception:
+        created = datetime.now().strftime("%a %b %d %H:%M:%S %Y")
+
+    quota_str = _fmt_quota_gb(quota_gb)
+
+    # Collect inbound streamSettings untuk generate link
+    vless_items = _collect_inbounds(cfg, "vless")
+    vmess_items = _collect_inbounds(cfg, "vmess")
+    trojan_items = _collect_inbounds(cfg, "trojan")
+
+    lines: List[str] = []
+    lines.append("=" * 50)
+    lines.append(f"{('XRAY ACCOUNT DETAIL (' + proto + ')'):^50}")
+    lines.append("=" * 50)
+    lines.append(f"Domain     : {domain}")
+    lines.append(f"IP         : {ipaddr}")
+    lines.append(f"Username   : {final_user}")
+    lines.append(f"UUID/Pass  : {secret}")
+    lines.append(f"QuotaLimit : {quota_str}")
+    lines.append(f"Expired    : {days} Hari")
+    lines.append(f"ValidUntil : {valid_until}")
+    lines.append(f"Created    : {created}")
+    lines.append("=" * 50)
+
+    # ✅ Generate link pakai port publik (public_port) via parameter builder
+    if proto == "vless":
+        lines.append("[VLESS]")
+        lines.extend(_build_links_for_vless(domain, final_user, secret, vless_items, public_port))
+
+    elif proto == "vmess":
+        lines.append("[VMESS]")
+        lines.extend(_build_links_for_vmess(domain, final_user, secret, vmess_items, public_port))
+
+    elif proto == "trojan":
+        lines.append("[TROJAN]")
+        lines.extend(_build_links_for_trojan(domain, final_user, secret, trojan_items, public_port))
+
+    else:  # allproto
+        lines.append("[VLESS]")
+        lines.extend(_build_links_for_vless(domain, final_user, secret, vless_items, public_port))
+        lines.append("-" * 50)
+        lines.append("[VMESS]")
+        lines.extend(_build_links_for_vmess(domain, final_user, secret, vmess_items, public_port))
+        lines.append("-" * 50)
+        lines.append("[TROJAN]")
+        lines.extend(_build_links_for_trojan(domain, final_user, secret, trojan_items, public_port))
+
+    lines.append("-" * 50)
+    lines.append("=" * 50)
+
+    content = "\n".join(lines) + "\n"
+
     base = DETAIL_BASE["allproto"] if proto == "allproto" else DETAIL_BASE[proto]
     base.mkdir(parents=True, exist_ok=True)
-
-    domain = _read_domain_from_nginx_conf()
-    ip = _get_ip()
-    expired_at = (date.today() + timedelta(days=days)).isoformat()
-    created_at = datetime.now().strftime("%a %b %e %H:%M:%S %Z %Y")
-    quota = _fmt_quota_gb(quota_gb)
-
-    if proto == "allproto":
-        # show links for vless/vmess/trojan; keep secret same
-        vless_items = _collect_inbounds(cfg, "vless")
-        vmess_items = _collect_inbounds(cfg, "vmess")
-        trojan_items = _collect_inbounds(cfg, "trojan")
-
-        vless_links = _build_links_for_vless(domain, final_u, secret, vless_items)
-        vmess_links = _build_links_for_vmess(domain, final_u, secret, vmess_items)
-        trojan_links = _build_links_for_trojan(domain, final_u, secret, trojan_items)
-
-        body = []
-        body.append("="*50)
-        body.append("           XRAY ACCOUNT DETAIL (allproto)")
-        body.append("="*50)
-        body.append(f"Domain     : {domain}")
-        body.append(f"IP         : {ip}")
-        body.append(f"Username   : {final_u}")
-        body.append(f"UUID/Pass  : {secret}")
-        body.append(f"QuotaLimit : {quota}")
-        body.append(f"Expired    : {days} Hari")
-        body.append(f"ValidUntil : {expired_at}")
-        body.append(f"Created    : {created_at}")
-        body.append("="*50)
-        body.append("[VLESS]")
-        body.extend(vless_links)
-        body.append("-"*50)
-        body.append("[VMESS]")
-        body.extend(vmess_links)
-        body.append("-"*50)
-        body.append("[TROJAN]")
-        body.extend(trojan_links)
-        body.append("-"*50)
-        body.append("="*50)
-        txt = "\n".join(body) + "\n"
-    else:
-        items = _collect_inbounds(cfg, proto)
-        if proto == "vless":
-            links = _build_links_for_vless(domain, final_u, secret, items)
-        elif proto == "vmess":
-            links = _build_links_for_vmess(domain, final_u, secret, items)
-        else:
-            links = _build_links_for_trojan(domain, final_u, secret, items)
-
-        body = []
-        body.append("="*50)
-        body.append(f"           XRAY ACCOUNT DETAIL ({proto})")
-        body.append("="*50)
-        body.append(f"Domain     : {domain}")
-        body.append(f"IP         : {ip}")
-        body.append(f"Username   : {final_u}")
-        body.append(f"UUID/Pass  : {secret}")
-        body.append(f"QuotaLimit : {quota}")
-        body.append(f"Expired    : {days} Hari")
-        body.append(f"ValidUntil : {expired_at}")
-        body.append(f"Created    : {created_at}")
-        body.append("="*50)
-        body.append(f"[{proto.upper()}]")
-        body.extend(links)
-        body.append("-"*50)
-        body.append("="*50)
-        txt = "\n".join(body) + "\n"
-
-    p = base / f"{final_u}.txt"
-    p.write_text(txt, encoding="utf-8")
-    return str(p)
+    out = base / f"{final_user}.txt"
+    out.write_text(content, encoding="utf-8")
+    return str(out)
 
 def handle_action(req: Dict[str, Any]) -> Dict[str, Any]:
     action = (req.get("action") or "").strip().lower()
