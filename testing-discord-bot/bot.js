@@ -183,16 +183,19 @@ function buildStatusText(xrayState, nginxState, ipcMs) {
   );
 }
 
+/**
+ * ✅ UPDATED TABLE: only No & Username
+ * Used by /accounts list and /del list
+ */
 function formatAccountsTable(items) {
-  const header = "No  Username                 Type     Expired";
+  const header = "No  Username";
   const lines = [header];
   for (let i = 0; i < items.length; i++) {
     const it = items[i] || {};
     const no = String(i + 1).padEnd(3, " ");
-    const user = String(it.username || "-").slice(0, 22).padEnd(22, " ");
-    const proto = String(it.protocol || "-").slice(0, 8).padEnd(8, " ");
-    const exp = String(it.expired_at || "-").slice(0, 10);
-    lines.push(`${no}${user}  ${proto} ${exp}`);
+    // keep username width reasonable for embed; truncate for safety
+    const user = String(it.username || "-").slice(0, 40);
+    lines.push(`${no}${user}`);
   }
   return "```\n" + lines.join("\n") + "\n```";
 }
@@ -284,7 +287,7 @@ function buildHelpEmbed(tab) {
       [
         "**/accounts** (admin only)",
         "",
-        "Menampilkan daftar akun dalam bentuk list + dropdown.",
+        "Menampilkan daftar akun (tabel: No & Username) + dropdown untuk pilih akun.",
         "Filter protocol dilakukan via tombol filter (ALL/VLESS/VMESS/TROJAN/ALLPROTO).",
         "",
         "Langkah:",
@@ -361,7 +364,6 @@ function buildHelpEmbed(tab) {
     return e;
   }
 
-  // fallback
   e.setDescription("Help tab not found.");
   return e;
 }
@@ -405,7 +407,6 @@ async function buildListMessage(kind, protoFilter, offset) {
 
   const tableBlock = items.length ? formatAccountsTable(items) : "_Tidak ada akun ditemukan._";
 
-  // ✅ Embed-only: table moved into embed description
   const embed = new EmbedBuilder()
     .setTitle(title)
     .setDescription(`${headerLine}\n\n${tableBlock}`)
@@ -446,6 +447,7 @@ async function buildListMessage(kind, protoFilter, offset) {
           const e = String(it.expired_at || "-");
           return {
             label: `${idx + 1}. ${u}`.slice(0, 100),
+            // dropdown masih menampilkan info tambahan biar mudah pilih (ini bukan "table")
             description: `${p} | exp ${e}`.slice(0, 100),
             value: u.slice(0, 100)
           };
@@ -597,7 +599,6 @@ client.on("interactionCreate", async (interaction) => {
       const detailPath = resp.detail_path;
       const jsonPath = resp.detail_json_path;
 
-      // ✅ Embed-only for /add success create
       const embed = new EmbedBuilder()
         .setTitle("✅ Created")
         .setDescription("Akun berhasil dibuat. Detail terlampir sebagai file .txt.")
@@ -670,7 +671,6 @@ client.on("interactionCreate", async (interaction) => {
           )
           .setFooter({ text: "Attached: XRAY ACCOUNT DETAIL (.txt)" });
 
-        // (tidak diminta berubah) ini masih bisa pakai content singkat, tapi biar rapi: embed-only juga
         return interaction.editReply({ content: null, embeds: [embed], files: [file] });
       }
 
@@ -691,7 +691,6 @@ client.on("interactionCreate", async (interaction) => {
             .setStyle(ButtonStyle.Secondary),
         );
 
-        // ✅ Embed-only for /del confirm delete
         const embed = new EmbedBuilder()
           .setTitle("⚠️ Confirm Delete")
           .setDescription("Klik **Confirm Delete** untuk menghapus akun ini.")
@@ -728,7 +727,7 @@ client.on("interactionCreate", async (interaction) => {
 
       const customId = String(interaction.customId || "");
 
-      // ✅ /help row filter buttons (tabs) — allowed for everyone
+      // /help tabs — allowed for everyone
       if (customId.startsWith("help:tab:")) {
         const tab = customId.split(":")[2] || "overview";
         const embed = buildHelpEmbed(tab);
@@ -741,8 +740,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "❌ Unauthorized", ephemeral: true });
       }
 
-      // ✅ Protocol filter buttons for /accounts & /del list
-      // customId: filt:<acct|del>:<proto>
+      // Protocol filter buttons for /accounts & /del list
       if (customId.startsWith("filt:")) {
         const parts = customId.split(":");
         if (parts.length !== 3) return interaction.reply({ content: "❌ Invalid filter button", ephemeral: true });
@@ -851,7 +849,6 @@ client.on("interactionCreate", async (interaction) => {
         if (!v.ok) return interaction.reply({ content: `❌ ${v.msg}`, ephemeral: true });
 
         if (action === "delcancel") {
-          // Not requested to be embed-only; keep simple
           return interaction.update({ content: "✅ Delete cancelled.", embeds: [], components: [] });
         }
 
@@ -892,14 +889,14 @@ client.on("interactionCreate", async (interaction) => {
 
   const cmd = interaction.commandName;
 
-  // ✅ /help: embed-only + row filter buttons (tabs)
+  // /help
   if (cmd === "help") {
     const embed = buildHelpEmbed("overview");
     const row = buildHelpTabRow("overview");
     return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
   }
 
-  // /ping content-only (tidak diminta berubah)
+  // /ping content-only
   if (cmd === "ping") {
     try {
       const wsMs = Math.round(client.ws.ping);
@@ -940,7 +937,7 @@ client.on("interactionCreate", async (interaction) => {
     return interaction.reply({ content: "❌ Unauthorized (admin role required).", ephemeral: true });
   }
 
-  // /status content-only (tidak diminta berubah)
+  // /status content-only
   if (cmd === "status") {
     try {
       const t0 = Date.now();
@@ -975,7 +972,7 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 
-  // ✅ /accounts: embed-only list
+  // /accounts embed-only list
   if (cmd === "accounts") {
     try {
       await interaction.deferReply({ ephemeral: true });
@@ -993,7 +990,7 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 
-  // /add starts protocol selection with buttons (not requested to be embed-only)
+  // /add starts protocol selection with buttons
   if (cmd === "add") {
     const row = buildAddProtocolButtons();
     const msg =
@@ -1004,12 +1001,11 @@ client.on("interactionCreate", async (interaction) => {
     return interaction.reply({ content: msg, components: [row], ephemeral: true });
   }
 
-  // ✅ /del — two modes
+  // /del — two modes
   if (cmd === "del") {
-    const protocolOpt = interaction.options.getString("protocol"); // may be null
-    const usernameOpt = interaction.options.getString("username"); // may be null
+    const protocolOpt = interaction.options.getString("protocol");
+    const usernameOpt = interaction.options.getString("username");
 
-    // direct confirm if BOTH protocol+username provided (confirm embed-only)
     if (protocolOpt && usernameOpt) {
       const protocol = String(protocolOpt).toLowerCase().trim();
       const username = String(usernameOpt).trim();
@@ -1028,7 +1024,6 @@ client.on("interactionCreate", async (interaction) => {
           .setStyle(ButtonStyle.Secondary),
       );
 
-      // ✅ Embed-only confirm
       const embed = new EmbedBuilder()
         .setTitle("⚠️ Confirm Delete")
         .setDescription("Klik **Confirm Delete** untuk menghapus akun ini.")
@@ -1048,7 +1043,6 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // list mode (embed-only)
     try {
       const initialFilter = protocolOpt ? String(protocolOpt).toLowerCase().trim() : "all";
       const protoFilter = LIST_PROTOCOLS.includes(initialFilter) ? initialFilter : "all";
