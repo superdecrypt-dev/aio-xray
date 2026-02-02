@@ -8,7 +8,7 @@ import socket
 from datetime import datetime, date, timedelta
 from urllib.parse import quote
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 from uuid import uuid4
 
 CONFIG = Path("/usr/local/etc/xray/config.json")
