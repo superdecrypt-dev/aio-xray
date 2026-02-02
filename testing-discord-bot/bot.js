@@ -105,6 +105,49 @@ function safeMkdirp(dir, mode = 0o700) {
 }
 
 /* =========================
+ * TIME (Asia/Jakarta)
+ * ========================= */
+const JAKARTA_TZ = "Asia/Jakarta";
+
+/**
+ * Format date/time to: YYYY-MM-DD HH:mm:ss (Asia/Jakarta)
+ * Examples:
+ *  - 2026-02-02 15:02:30
+ *
+ * Input can be Date or ISO string.
+ */
+function fmtDateTimeJakarta(dateOrIso) {
+  try {
+    const d = (dateOrIso instanceof Date) ? dateOrIso : new Date(dateOrIso);
+    if (isNaN(d.getTime())) return "-";
+
+    const parts = new Intl.DateTimeFormat("sv-SE", {
+      timeZone: JAKARTA_TZ,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).formatToParts(d);
+
+    const get = (type) => parts.find(p => p.type === type)?.value || "00";
+    return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}:${get("second")}`;
+  } catch (_) {
+    // Fallback manual UTC+7 (Jakarta tidak pakai DST)
+    try {
+      const d = (dateOrIso instanceof Date) ? dateOrIso : new Date(dateOrIso);
+      if (isNaN(d.getTime())) return "-";
+      const j = new Date(d.getTime() + 7 * 60 * 60 * 1000);
+      return j.toISOString().slice(0, 19).replace("T", " ");
+    } catch {
+      return "-";
+    }
+  }
+}
+
+/* =========================
  * HELP PANEL (row buttons)
  * ========================= */
 function buildHelpButtons(activeTab) {
@@ -264,7 +307,6 @@ function buildHelpEmbed(tab) {
     return e;
   }
 
-  // fallback
   e.setDescription("Help tab not found.");
   return e;
 }
@@ -358,7 +400,9 @@ function startNotifyScheduler(client) {
 }
 
 function buildNotifyMessageText({ wsMs, ipcMs, xrayState, nginxState, error }) {
-  const ts = new Date().toISOString();
+  // ✅ Display: Asia/Jakarta "YYYY-MM-DD HH:mm:ss"
+  const ts = fmtDateTimeJakarta(new Date());
+
   const lines = [];
   lines.push("```");
   lines.push("🛎️ NOTIFIKASI XRAY (Berkala)");
@@ -406,7 +450,7 @@ async function sendNotifyTick(client, { force = false } = {}) {
     if (!pingResp || pingResp.status !== "ok") {
       const msg = pingResp && pingResp.error ? pingResp.error : "backend ping failed";
       notifyCfg.last_error = msg;
-      notifyCfg.last_run_at = new Date().toISOString();
+      notifyCfg.last_run_at = new Date().toISOString(); // keep ISO UTC
       saveNotifyCfg();
 
       await ch.send({ content: buildNotifyMessageText({ wsMs, ipcMs, error: msg }) });
@@ -416,7 +460,7 @@ async function sendNotifyTick(client, { force = false } = {}) {
     if (!statusResp || statusResp.status !== "ok") {
       const msg = statusResp && statusResp.error ? statusResp.error : "backend status failed";
       notifyCfg.last_error = msg;
-      notifyCfg.last_run_at = new Date().toISOString();
+      notifyCfg.last_run_at = new Date().toISOString(); // keep ISO UTC
       saveNotifyCfg();
 
       await ch.send({ content: buildNotifyMessageText({ wsMs, ipcMs, error: msg }) });
@@ -424,7 +468,7 @@ async function sendNotifyTick(client, { force = false } = {}) {
     }
 
     notifyCfg.last_error = null;
-    notifyCfg.last_run_at = new Date().toISOString();
+    notifyCfg.last_run_at = new Date().toISOString(); // keep ISO UTC
     saveNotifyCfg();
 
     await ch.send({
@@ -438,7 +482,7 @@ async function sendNotifyTick(client, { force = false } = {}) {
   } catch (e) {
     const msg = mapBackendError(e);
     notifyCfg.last_error = msg;
-    notifyCfg.last_run_at = new Date().toISOString();
+    notifyCfg.last_run_at = new Date().toISOString(); // keep ISO UTC
     saveNotifyCfg();
     try {
       await ch.send({ content: buildNotifyMessageText({ wsMs: Math.round(client.ws.ping), ipcMs: 0, error: msg }) });
@@ -611,7 +655,10 @@ function buildNotifyPanel({ extraRow } = {}) {
   const status = notifyCfg.enabled ? "🟢 ON" : "🔴 OFF";
   const ch = notifyCfg.channel_id ? `<#${notifyCfg.channel_id}>` : "`(belum diatur)`";
   const iv = `${notifyCfg.interval_min} menit`;
-  const lastRun = notifyCfg.last_run_at ? `\`${notifyCfg.last_run_at}\`` : "`-`";
+
+  // ✅ Display: Asia/Jakarta "YYYY-MM-DD HH:mm:ss"
+  const lastRun = notifyCfg.last_run_at ? `\`${fmtDateTimeJakarta(notifyCfg.last_run_at)}\`` : "`-`";
+
   const lastErr = notifyCfg.last_error ? `\`${String(notifyCfg.last_error).slice(0, 180)}\`` : "`-`";
 
   const embed = new EmbedBuilder()
