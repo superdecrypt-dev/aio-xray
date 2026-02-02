@@ -31,6 +31,7 @@ const QUICK_REPLY_MS = 1200;
 
 const PAGE_SIZE = 25; // Discord select menu max options
 const ADD_PROTOCOLS = ["vless", "vmess", "trojan", "allproto"];
+const LIST_PROTOCOLS = ["all", "vless", "vmess", "trojan", "allproto"];
 
 if (!TOKEN || !GUILD_ID || !ADMIN_ROLE_ID || !CLIENT_ID) {
   console.error("Missing env vars: DISCORD_BOT_TOKEN / DISCORD_GUILD_ID / DISCORD_ADMIN_ROLE_ID / DISCORD_CLIENT_ID");
@@ -195,9 +196,39 @@ function formatAccountsTable(items) {
   return "```\n" + lines.join("\n") + "\n```";
 }
 
+/**
+ * Row filter buttons:
+ * - prefix: "acct" or "del"
+ * - active: one of LIST_PROTOCOLS
+ */
+function buildFilterRow(prefix, active) {
+  active = String(active || "all").toLowerCase().trim();
+  if (!LIST_PROTOCOLS.includes(active)) active = "all";
+
+  const mk = (proto, label, emoji) => {
+    const isActive = active === proto;
+    return new ButtonBuilder()
+      .setCustomId(`filt:${prefix}:${proto}`)
+      .setLabel(label)
+      .setEmoji(emoji)
+      .setStyle(isActive ? ButtonStyle.Primary : ButtonStyle.Secondary);
+  };
+
+  return new ActionRowBuilder().addComponents(
+    mk("all", "ALL", "📌"),
+    mk("vless", "VLESS", "🟦"),
+    mk("vmess", "VMESS", "🟩"),
+    mk("trojan", "TROJAN", "🟥"),
+    mk("allproto", "ALLPROTO", "🟪"),
+  );
+}
+
 async function buildListMessage(kind, protoFilter, offset) {
   // kind: "acct" or "del"
+  const prefix = kind === "del" ? "del" : "acct";
   protoFilter = String(protoFilter || "all").toLowerCase().trim();
+  if (!LIST_PROTOCOLS.includes(protoFilter)) protoFilter = "all";
+
   offset = clampInt(Number(offset || 0), 0, 10_000_000);
 
   const resp = await callBackend({
@@ -221,7 +252,6 @@ async function buildListMessage(kind, protoFilter, offset) {
   const hasMore = !!resp.has_more;
 
   const title = kind === "del" ? "🗑️ Delete Accounts" : "📚 XRAY Accounts";
-  const prefix = kind === "del" ? "del" : "acct";
 
   const headerLine =
     kind === "del"
@@ -233,10 +263,14 @@ async function buildListMessage(kind, protoFilter, offset) {
   const embed = new EmbedBuilder()
     .setTitle(title)
     .setDescription(kind === "del"
-      ? "Pilih akun → akan muncul tombol **Confirm Delete / Cancel**."
-      : "Pilih akun → bot akan meng-attach ulang file **.txt**.")
+      ? "Gunakan tombol filter di atas untuk memilih protocol. Lalu pilih akun → confirm."
+      : "Gunakan tombol filter di atas untuk memilih protocol. Lalu pilih akun → attach .txt.")
     .setFooter({ text: `Filter: ${protoFilter} | Showing ${items.length} of ${total} | Offset ${offset}` });
 
+  // ✅ No "Quick actions" extra row: only Filter + (Dropdown) + Paging.
+  const filterRow = buildFilterRow(prefix, protoFilter);
+
+  // Paging row: Prev/Next only (no Refresh).
   const nav = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`${prefix}:prev:${protoFilter}:${offset}`)
@@ -245,11 +279,6 @@ async function buildListMessage(kind, protoFilter, offset) {
       .setEmoji("⬅️")
       .setDisabled(offset <= 0),
     new ButtonBuilder()
-      .setCustomId(`${prefix}:ref:${protoFilter}:${offset}`)
-      .setLabel("Refresh")
-      .setStyle(ButtonStyle.Secondary)
-      .setEmoji("🔄"),
-    new ButtonBuilder()
       .setCustomId(`${prefix}:next:${protoFilter}:${offset}`)
       .setLabel("Next")
       .setStyle(ButtonStyle.Secondary)
@@ -257,7 +286,7 @@ async function buildListMessage(kind, protoFilter, offset) {
       .setDisabled(!hasMore),
   );
 
-  const components = [nav];
+  const components = [filterRow, nav];
 
   if (items.length > 0) {
     const placeholder = kind === "del"
@@ -280,7 +309,8 @@ async function buildListMessage(kind, protoFilter, offset) {
         })
       );
 
-    components.unshift(new ActionRowBuilder().addComponents(menu));
+    // Insert dropdown row between filterRow and nav
+    components.splice(1, 0, new ActionRowBuilder().addComponents(menu));
   }
 
   const content = `${headerLine}\n${tableBlock}`;
@@ -338,39 +368,23 @@ async function registerCommands() {
     new SlashCommandBuilder().setName("ping").setDescription("Health check bot + backend latency (ms)"),
     new SlashCommandBuilder().setName("status").setDescription("Status service Xray dan Nginx (admin only)"),
 
+    // ✅ /accounts: no protocol/page options (filter via buttons)
     new SlashCommandBuilder()
       .setName("accounts")
-      .setDescription("List akun + ambil ulang XRAY ACCOUNT DETAIL (.txt) (admin only)")
-      .addStringOption(o =>
-        o.setName("protocol")
-          .setDescription("Filter protocol")
-          .setRequired(false)
-          .addChoices(
-            { name: "all", value: "all" },
-            { name: "vless", value: "vless" },
-            { name: "vmess", value: "vmess" },
-            { name: "trojan", value: "trojan" },
-            { name: "allproto", value: "allproto" },
-          )
-      )
-      .addIntegerOption(o =>
-        o.setName("page")
-          .setDescription("Halaman (1=awal)")
-          .setRequired(false)
-          .setMinValue(1)
-      ),
+      .setDescription("List akun + ambil ulang XRAY ACCOUNT DETAIL (.txt) (admin only)"),
 
-    // ✅ /add is now interactive: protocol via buttons, inputs via modal
+    // ✅ /add is interactive: protocol via buttons, inputs via modal
     new SlashCommandBuilder()
       .setName("add")
       .setDescription("Create Xray user (interactive: pilih protocol via button) (admin only)"),
 
+    // ✅ /del: keep optional protocol+username for direct delete confirm (list filter via buttons)
     new SlashCommandBuilder()
       .setName("del")
       .setDescription("Delete Xray user (list & confirm) (admin only)")
       .addStringOption(o =>
         o.setName("protocol")
-          .setDescription("Filter protocol untuk list, atau protocol untuk delete langsung")
+          .setDescription("Untuk delete langsung: isi protocol + username. Untuk list: optional sebagai initial filter.")
           .setRequired(false)
           .addChoices(
             { name: "all", value: "all" },
@@ -384,12 +398,6 @@ async function registerCommands() {
         o.setName("username")
           .setDescription("Jika diisi, bot akan minta confirm delete untuk user ini (tanpa suffix)")
           .setRequired(false)
-      )
-      .addIntegerOption(o =>
-        o.setName("page")
-          .setDescription("Halaman list (1=awal)")
-          .setRequired(false)
-          .setMinValue(1)
       ),
   ].map(c => c.toJSON());
 
@@ -588,6 +596,33 @@ client.on("interactionCreate", async (interaction) => {
 
       const customId = String(interaction.customId || "");
 
+      // ✅ Filter buttons for /accounts & /del list
+      // customId: filt:<acct|del>:<proto>
+      if (customId.startsWith("filt:")) {
+        const parts = customId.split(":");
+        if (parts.length !== 3) return interaction.reply({ content: "❌ Invalid filter button", ephemeral: true });
+
+        const prefix = String(parts[1] || "").trim(); // acct|del
+        const proto = String(parts[2] || "all").toLowerCase().trim();
+
+        if (!["acct", "del"].includes(prefix)) {
+          return interaction.reply({ content: "❌ Invalid filter target", ephemeral: true });
+        }
+        if (!LIST_PROTOCOLS.includes(proto)) {
+          return interaction.reply({ content: "❌ Invalid filter protocol", ephemeral: true });
+        }
+
+        await interaction.deferUpdate();
+        const payload = await buildListMessage(prefix === "del" ? "del" : "acct", proto, 0);
+
+        return interaction.editReply({
+          content: payload.content,
+          embeds: payload.embeds,
+          components: payload.components,
+          files: []
+        });
+      }
+
       // ✅ /add protocol selector buttons
       if (customId.startsWith("addproto:")) {
         const protocol = customId.split(":")[1] || "";
@@ -598,21 +633,24 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
       }
 
-      // paging buttons for accounts/delete lists
+      // paging buttons for accounts/delete lists (Prev/Next only)
       if (customId.startsWith("acct:") || customId.startsWith("del:")) {
         const parts = customId.split(":");
         if (parts.length !== 4) return interaction.reply({ content: "❌ Invalid button", ephemeral: true });
 
         const prefix = parts[0]; // acct|del
-        const kind = String(parts[1] || "").trim();
+        const kind = String(parts[1] || "").trim(); // prev|next
         const protoFilter = String(parts[2] || "all").toLowerCase().trim();
         const offset = clampInt(parseInt(parts[3], 10), 0, 10_000_000);
+
+        if (!LIST_PROTOCOLS.includes(protoFilter)) {
+          return interaction.reply({ content: "❌ Invalid filter state", ephemeral: true });
+        }
 
         let nextOffset = offset;
         if (kind === "next") nextOffset = offset + PAGE_SIZE;
         else if (kind === "prev") nextOffset = Math.max(0, offset - PAGE_SIZE);
-        else if (kind === "ref") nextOffset = offset;
-        else return interaction.reply({ content: "❌ Invalid button", ephemeral: true });
+        else return interaction.reply({ content: "❌ Invalid navigation button", ephemeral: true });
 
         await interaction.deferUpdate();
         const payload = await buildListMessage(prefix === "del" ? "del" : "acct", protoFilter, nextOffset);
@@ -711,9 +749,9 @@ client.on("interactionCreate", async (interaction) => {
       .setTitle("📘 XRAY Discord Bot Help")
       .setDescription("Bot ini untuk manajemen akun Xray via backend service (IPC).")
       .addFields(
-        { name: "/add", value: "Buat akun: **pilih protocol via button**, lalu isi form (username/days/quota). **Admin only**", inline: false },
-        { name: "/del", value: "Hapus akun via list+pilih+confirm. Atau isi protocol+username untuk confirm langsung. **Admin only**", inline: false },
-        { name: "/accounts", value: "List akun (paging) + pilih untuk ambil ulang detail (.txt). **Admin only**", inline: false },
+        { name: "/add", value: "Buat akun: pilih protocol via button, lalu isi form (username/days/quota). **Admin only**", inline: false },
+        { name: "/del", value: "Hapus akun via list+pilih+confirm. Bisa juga isi protocol+username untuk confirm langsung. **Admin only**", inline: false },
+        { name: "/accounts", value: "List akun + pilih untuk ambil ulang detail (.txt). Filter via tombol di atas list. **Admin only**", inline: false },
         { name: "/ping", value: "Cek bot hidup + latency backend (ms).", inline: false },
         { name: "/status", value: "Lihat status service Xray & Nginx. **Admin only**", inline: false },
         { name: "Aturan username", value: "`[A-Za-z0-9_]` (tanpa suffix). Bot akan menambahkan `@vless/@vmess/@trojan/@allproto`.", inline: false },
@@ -800,15 +838,11 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 
-  // /accounts
+  // ✅ /accounts: always open list with filter buttons (default all)
   if (cmd === "accounts") {
     try {
-      const protoFilter = String(interaction.options.getString("protocol") || "all").toLowerCase().trim();
-      const page = interaction.options.getInteger("page") || 1;
-      const offset = Math.max(0, (page - 1) * PAGE_SIZE);
-
       await interaction.deferReply({ ephemeral: true });
-      const payload = await buildListMessage("acct", protoFilter, offset);
+      const payload = await buildListMessage("acct", "all", 0);
 
       return interaction.editReply({
         content: payload.content,
@@ -823,7 +857,7 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 
-  // ✅ /add now starts protocol selection with buttons
+  // /add starts protocol selection with buttons
   if (cmd === "add") {
     const row = buildAddProtocolButtons();
     const msg =
@@ -839,9 +873,8 @@ client.on("interactionCreate", async (interaction) => {
   if (cmd === "del") {
     const protocolOpt = interaction.options.getString("protocol"); // may be null
     const usernameOpt = interaction.options.getString("username"); // may be null
-    const page = interaction.options.getInteger("page") || 1;
 
-    // Mode B: direct confirm if BOTH protocol+username provided
+    // Mode B: direct confirm if BOTH protocol+username provided (old behavior preserved)
     if (protocolOpt && usernameOpt) {
       const protocol = String(protocolOpt).toLowerCase().trim();
       const username = String(usernameOpt).trim();
@@ -872,17 +905,21 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.reply({ content: "⚠️ Confirm delete", embeds: [embed], components: [row], ephemeral: true });
     }
 
+    // If username provided but protocol missing => error (keep strict)
     if (!protocolOpt && usernameOpt) {
-      return interaction.reply({ content: "❌ Jika ingin delete langsung, isi juga option protocol. Atau jalankan /del tanpa username untuk mode list.", ephemeral: true });
+      return interaction.reply({
+        content: "❌ Jika ingin delete langsung, isi juga option protocol. Atau jalankan /del tanpa username untuk mode list.",
+        ephemeral: true
+      });
     }
 
     // Mode A: interactive list (default)
     try {
-      const protoFilter = String(protocolOpt || "all").toLowerCase().trim();
-      const offset = Math.max(0, (page - 1) * PAGE_SIZE);
+      const initialFilter = protocolOpt ? String(protocolOpt).toLowerCase().trim() : "all";
+      const protoFilter = LIST_PROTOCOLS.includes(initialFilter) ? initialFilter : "all";
 
       await interaction.deferReply({ ephemeral: true });
-      const payload = await buildListMessage("del", protoFilter, offset);
+      const payload = await buildListMessage("del", protoFilter, 0);
 
       return interaction.editReply({
         content: payload.content,
