@@ -12,7 +12,10 @@ const {
   ActionRowBuilder,
   StringSelectMenuBuilder,
   ButtonBuilder,
-  ButtonStyle
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle
 } = require("discord.js");
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN;
@@ -27,6 +30,7 @@ const BACKEND_TIMEOUT_MS = 8000;
 const QUICK_REPLY_MS = 1200;
 
 const PAGE_SIZE = 25; // Discord select menu max options
+const ADD_PROTOCOLS = ["vless", "vmess", "trojan", "allproto"];
 
 if (!TOKEN || !GUILD_ID || !ADMIN_ROLE_ID || !CLIENT_ID) {
   console.error("Missing env vars: DISCORD_BOT_TOKEN / DISCORD_GUILD_ID / DISCORD_ADMIN_ROLE_ID / DISCORD_CLIENT_ID");
@@ -127,14 +131,14 @@ function callBackend(req) {
 
 function lightValidate(protocol, username, days, quota_gb) {
   protocol = String(protocol || "").toLowerCase().trim();
-  const okProto = ["vless", "vmess", "trojan", "allproto"].includes(protocol);
+  const okProto = ADD_PROTOCOLS.includes(protocol);
   if (!okProto) return { ok: false, msg: "protocol invalid" };
   if (!/^[A-Za-z0-9_]+$/.test(username || "")) return { ok: false, msg: "username invalid" };
   if (days !== undefined) {
     if (!Number.isInteger(days) || days < 1 || days > 3650) return { ok: false, msg: "days out of range (1..3650)" };
   }
   if (quota_gb !== undefined) {
-    if (typeof quota_gb !== "number" || quota_gb < 0) return { ok: false, msg: "quota_gb must be >= 0" };
+    if (typeof quota_gb !== "number" || !Number.isFinite(quota_gb) || quota_gb < 0) return { ok: false, msg: "quota_gb must be >= 0" };
   }
   return { ok: true, protocol };
 }
@@ -153,7 +157,7 @@ function buildDetailTxtPath(proto, finalEmail) {
   return path.join(baseDir, `${finalEmail}.txt`);
 }
 
-// ✅ TEXT-ONLY (NO EMBED) for /ping & /status
+// ✅ TEXT-ONLY for /ping & /status
 function buildPingText(wsMs, ipcMs) {
   return (
     "```" +
@@ -219,7 +223,6 @@ async function buildListMessage(kind, protoFilter, offset) {
   const title = kind === "del" ? "🗑️ Delete Accounts" : "📚 XRAY Accounts";
   const prefix = kind === "del" ? "del" : "acct";
 
-  // ✅ Table moved to CONTENT (more stable in dark/light)
   const headerLine =
     kind === "del"
       ? "🗑️ Delete mode — pilih akun dari dropdown, lalu konfirmasi."
@@ -227,7 +230,6 @@ async function buildListMessage(kind, protoFilter, offset) {
 
   const tableBlock = items.length ? formatAccountsTable(items) : "Tidak ada akun ditemukan.";
 
-  // Embed only for title/summary (no table)
   const embed = new EmbedBuilder()
     .setTitle(title)
     .setDescription(kind === "del"
@@ -285,6 +287,51 @@ async function buildListMessage(kind, protoFilter, offset) {
   return { content, embeds: [embed], components, ephemeral: true };
 }
 
+function buildAddProtocolButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("addproto:vless").setLabel("VLESS").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("addproto:vmess").setLabel("VMESS").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("addproto:trojan").setLabel("TROJAN").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("addproto:allproto").setLabel("ALLPROTO").setStyle(ButtonStyle.Success),
+  );
+}
+
+function buildAddModal(protocol) {
+  const modal = new ModalBuilder()
+    .setCustomId(`addmodal:${protocol}`)
+    .setTitle(`Create Account (${protocol})`);
+
+  const usernameInput = new TextInputBuilder()
+    .setCustomId("username")
+    .setLabel("Username (tanpa suffix) [A-Za-z0-9_]")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMinLength(1)
+    .setMaxLength(32);
+
+  const daysInput = new TextInputBuilder()
+    .setCustomId("days")
+    .setLabel("Masa aktif (hari) 1..3650")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setPlaceholder("30");
+
+  const quotaInput = new TextInputBuilder()
+    .setCustomId("quota_gb")
+    .setLabel("Quota (GB) 0=unlimited")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setPlaceholder("0");
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(usernameInput),
+    new ActionRowBuilder().addComponents(daysInput),
+    new ActionRowBuilder().addComponents(quotaInput),
+  );
+
+  return modal;
+}
+
 async function registerCommands() {
   const commands = [
     new SlashCommandBuilder().setName("help").setDescription("Cara pakai bot & penjelasan fungsi"),
@@ -313,13 +360,10 @@ async function registerCommands() {
           .setMinValue(1)
       ),
 
+    // ✅ /add is now interactive: protocol via buttons, inputs via modal
     new SlashCommandBuilder()
       .setName("add")
-      .setDescription("Create Xray user (via Python backend)")
-      .addStringOption(o => o.setName("protocol").setDescription("vless/vmess/trojan/allproto").setRequired(true))
-      .addStringOption(o => o.setName("username").setDescription("username tanpa suffix [a-zA-Z0-9_]").setRequired(true))
-      .addIntegerOption(o => o.setName("days").setDescription("masa aktif (hari)").setRequired(true))
-      .addNumberOption(o => o.setName("quota_gb").setDescription("quota (GB), 0=unlimited").setRequired(true)),
+      .setDescription("Create Xray user (interactive: pilih protocol via button) (admin only)"),
 
     new SlashCommandBuilder()
       .setName("del")
@@ -360,6 +404,92 @@ client.once("ready", () => {
 });
 
 client.on("interactionCreate", async (interaction) => {
+
+  // --------------------
+  // MODALS (for /add)
+  // --------------------
+  if (interaction.isModalSubmit()) {
+    try {
+      if (String(interaction.guildId) !== String(GUILD_ID)) {
+        return interaction.reply({ content: "❌ Wrong guild", ephemeral: true });
+      }
+      if (!isAdmin(interaction.member)) {
+        return interaction.reply({ content: "❌ Unauthorized", ephemeral: true });
+      }
+
+      const cid = String(interaction.customId || "");
+      if (!cid.startsWith("addmodal:")) {
+        return interaction.reply({ content: "❌ Unknown modal", ephemeral: true });
+      }
+
+      const protocol = cid.split(":")[1] || "";
+      if (!ADD_PROTOCOLS.includes(protocol)) {
+        return interaction.reply({ content: "❌ Invalid protocol", ephemeral: true });
+      }
+
+      const usernameRaw = String(interaction.fields.getTextInputValue("username") || "").trim();
+      const daysRaw = String(interaction.fields.getTextInputValue("days") || "").trim();
+      const quotaRaw = String(interaction.fields.getTextInputValue("quota_gb") || "").trim();
+
+      const days = parseInt(daysRaw, 10);
+      const quota_gb = Number(quotaRaw);
+
+      const v = lightValidate(protocol, usernameRaw, days, quota_gb);
+      if (!v.ok) {
+        return interaction.reply({ content: `❌ ${v.msg}`, ephemeral: true });
+      }
+
+      await interaction.deferReply({ ephemeral: true });
+
+      const resp = await callBackend({ action: "add", protocol: v.protocol, username: usernameRaw, days, quota_gb });
+      if (resp.status !== "ok") {
+        return interaction.editReply(`❌ Failed: ${resp.error || "unknown error"}`);
+      }
+
+      const finalEmail = resp.username;
+      const secret = resp.password || resp.uuid || "(hidden)";
+      const detailPath = resp.detail_path;
+      const jsonPath = resp.detail_json_path;
+
+      const embed = new EmbedBuilder()
+        .setTitle("✅ Created")
+        .addFields(
+          { name: "Protocol", value: v.protocol, inline: true },
+          { name: "Username", value: finalEmail, inline: true },
+          { name: "UUID/Pass", value: `\`${secret}\``, inline: false },
+          { name: "Valid Until", value: resp.expired_at || "-", inline: true },
+          { name: "Quota", value: `${quota_gb} GB`, inline: true },
+        )
+        .setFooter({ text: "Detail attached as .txt (XRAY ACCOUNT DETAIL)" });
+
+      const files = [];
+      if (detailPath && fs.existsSync(detailPath)) {
+        files.push(new AttachmentBuilder(detailPath, { name: path.basename(detailPath) }));
+      }
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`detail:${v.protocol}:${finalEmail}`)
+          .setLabel("Resend Detail TXT")
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+      const content =
+        `✅ Created\n` +
+        `Protocol: ${v.protocol}\n` +
+        `Username: ${finalEmail}\n` +
+        `Valid Until: ${resp.expired_at || "-"}\n` +
+        `Quota: ${quota_gb} GB\n` +
+        (jsonPath ? `JSON: ${jsonPath}\n` : "");
+
+      return interaction.editReply({ content, embeds: [embed], components: [row], files });
+    } catch (e) {
+      console.error(e);
+      const msg = mapBackendError(e);
+      if (interaction.deferred) return interaction.editReply(`❌ ${msg}`);
+      return interaction.reply({ content: `❌ ${msg}`, ephemeral: true });
+    }
+  }
 
   // --------------------
   // SELECT MENUS
@@ -458,6 +588,16 @@ client.on("interactionCreate", async (interaction) => {
 
       const customId = String(interaction.customId || "");
 
+      // ✅ /add protocol selector buttons
+      if (customId.startsWith("addproto:")) {
+        const protocol = customId.split(":")[1] || "";
+        if (!ADD_PROTOCOLS.includes(protocol)) {
+          return interaction.reply({ content: "❌ Invalid protocol", ephemeral: true });
+        }
+        const modal = buildAddModal(protocol);
+        return interaction.showModal(modal);
+      }
+
       // paging buttons for accounts/delete lists
       if (customId.startsWith("acct:") || customId.startsWith("del:")) {
         const parts = customId.split(":");
@@ -492,7 +632,7 @@ client.on("interactionCreate", async (interaction) => {
 
         const proto = String(parts[1] || "").toLowerCase().trim();
         const finalEmail = String(parts[2] || "").trim();
-        if (!["vless", "vmess", "trojan", "allproto"].includes(proto)) {
+        if (!ADD_PROTOCOLS.includes(proto)) {
           return interaction.reply({ content: "❌ Invalid protocol", ephemeral: true });
         }
 
@@ -571,7 +711,7 @@ client.on("interactionCreate", async (interaction) => {
       .setTitle("📘 XRAY Discord Bot Help")
       .setDescription("Bot ini untuk manajemen akun Xray via backend service (IPC).")
       .addFields(
-        { name: "/add", value: "Membuat akun Xray + mengirim detail (.txt). **Admin only**", inline: false },
+        { name: "/add", value: "Buat akun: **pilih protocol via button**, lalu isi form (username/days/quota). **Admin only**", inline: false },
         { name: "/del", value: "Hapus akun via list+pilih+confirm. Atau isi protocol+username untuk confirm langsung. **Admin only**", inline: false },
         { name: "/accounts", value: "List akun (paging) + pilih untuk ambil ulang detail (.txt). **Admin only**", inline: false },
         { name: "/ping", value: "Cek bot hidup + latency backend (ms).", inline: false },
@@ -584,7 +724,7 @@ client.on("interactionCreate", async (interaction) => {
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
 
-  // /ping is read-only, open to guild members (TEXT ONLY)
+  // /ping text-only, open to guild members
   if (cmd === "ping") {
     try {
       const wsMs = Math.round(client.ws.ping);
@@ -625,7 +765,7 @@ client.on("interactionCreate", async (interaction) => {
     return interaction.reply({ content: "❌ Unauthorized (admin role required).", ephemeral: true });
   }
 
-  // /status (admin-only) (TEXT ONLY)
+  // /status text-only
   if (cmd === "status") {
     try {
       const t0 = Date.now();
@@ -660,7 +800,7 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 
-  // /accounts (admin-only)
+  // /accounts
   if (cmd === "accounts") {
     try {
       const protoFilter = String(interaction.options.getString("protocol") || "all").toLowerCase().trim();
@@ -683,76 +823,25 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 
-  // /add (admin-only)
+  // ✅ /add now starts protocol selection with buttons
   if (cmd === "add") {
-    try {
-      const protocol = interaction.options.getString("protocol");
-      const username = interaction.options.getString("username");
-      const days = interaction.options.getInteger("days");
-      const quota_gb = interaction.options.getNumber("quota_gb");
+    const row = buildAddProtocolButtons();
+    const msg =
+      "🧩 **Create Account**\n" +
+      "1) Pilih protocol via button\n" +
+      "2) Isi form (username/days/quota)\n\n" +
+      "Catatan: username tanpa suffix, hanya `[A-Za-z0-9_]`";
 
-      const v = lightValidate(protocol, username, days, quota_gb);
-      if (!v.ok) return interaction.reply({ content: `❌ ${v.msg}`, ephemeral: true });
-
-      await interaction.deferReply({ ephemeral: true });
-
-      const resp = await callBackend({ action: "add", protocol: v.protocol, username, days, quota_gb });
-      if (resp.status !== "ok") {
-        return interaction.editReply(`❌ Failed: ${resp.error || "unknown error"}`);
-      }
-
-      const finalEmail = resp.username;
-      const secret = resp.password || resp.uuid || "(hidden)";
-      const detailPath = resp.detail_path;
-      const jsonPath = resp.detail_json_path;
-
-      const embed = new EmbedBuilder()
-        .setTitle("✅ Created")
-        .addFields(
-          { name: "Protocol", value: v.protocol, inline: true },
-          { name: "Username", value: finalEmail, inline: true },
-          { name: "UUID/Pass", value: `\`${secret}\``, inline: false },
-          { name: "Valid Until", value: resp.expired_at || "-", inline: true },
-          { name: "Quota", value: `${quota_gb} GB`, inline: true },
-        )
-        .setFooter({ text: "Detail attached as .txt (XRAY ACCOUNT DETAIL)" });
-
-      const files = [];
-      if (detailPath && fs.existsSync(detailPath)) {
-        files.push(new AttachmentBuilder(detailPath, { name: path.basename(detailPath) }));
-      }
-
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`detail:${v.protocol}:${finalEmail}`)
-          .setLabel("Resend Detail TXT")
-          .setStyle(ButtonStyle.Secondary)
-      );
-
-      const content =
-        `✅ Created\n` +
-        `Protocol: ${v.protocol}\n` +
-        `Username: ${finalEmail}\n` +
-        `Valid Until: ${resp.expired_at || "-"}\n` +
-        `Quota: ${quota_gb} GB\n` +
-        (jsonPath ? `JSON: ${jsonPath}\n` : "");
-
-      return interaction.editReply({ content, embeds: [embed], components: [row], files });
-    } catch (e) {
-      console.error(e);
-      const msg = mapBackendError(e);
-      if (interaction.deferred) return interaction.editReply(`❌ ${msg}`);
-      return interaction.reply({ content: `❌ ${msg}`, ephemeral: true });
-    }
+    return interaction.reply({ content: msg, components: [row], ephemeral: true });
   }
 
-  // /del (admin-only) — two modes
+  // /del — two modes
   if (cmd === "del") {
     const protocolOpt = interaction.options.getString("protocol"); // may be null
     const usernameOpt = interaction.options.getString("username"); // may be null
     const page = interaction.options.getInteger("page") || 1;
 
-    // Mode B: direct confirm if BOTH protocol+username provided (old behavior preserved)
+    // Mode B: direct confirm if BOTH protocol+username provided
     if (protocolOpt && usernameOpt) {
       const protocol = String(protocolOpt).toLowerCase().trim();
       const username = String(usernameOpt).trim();
@@ -783,7 +872,6 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.reply({ content: "⚠️ Confirm delete", embeds: [embed], components: [row], ephemeral: true });
     }
 
-    // If username provided but protocol missing => error (keep strict)
     if (!protocolOpt && usernameOpt) {
       return interaction.reply({ content: "❌ Jika ingin delete langsung, isi juga option protocol. Atau jalankan /del tanpa username untuk mode list.", ephemeral: true });
     }
