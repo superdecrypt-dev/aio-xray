@@ -34,21 +34,30 @@ const QUICK_REPLY_MS = 1200;
 const PAGE_SIZE = 25; // Discord select menu max options
 const ADD_PROTOCOLS = ["vless", "vmess", "trojan", "allproto"];
 const LIST_PROTOCOLS = ["all", "vless", "vmess", "trojan", "allproto"];
-const HELP_TABS = ["overview", "accounts", "add", "del", "ping", "status"];
+
+// /help tabs (interactive)
+const HELP_TABS = ["overview", "accounts", "add", "del", "notify", "ping", "status"];
 
 // /notify state (persist)
 const NOTIFY_STATE_PATH = "/opt/xray-discord-bot/state/notify.json";
-const NOTIFY_MIN_INTERVAL_MIN = 5;
-const NOTIFY_MAX_INTERVAL_MIN = 10080; // 7 days
+const NOTIFY_MIN_INTERVAL_MIN = 1;
+// "unlimited" praktis: kita izinkan angka sangat besar (100 tahun)
+const NOTIFY_MAX_INTERVAL_MIN = 52560000; // 100 years
+
+// batas maksimal timeout Node (2^31-1 ms). Kita pakai sedikit lebih kecil untuk aman.
+const NOTIFY_MAX_TIMEOUT_MS = 2_000_000_000;
 
 let notifyCfg = {
   enabled: false,
   channel_id: null,
   interval_min: 60,
-  last_run_at: null,   // ISO string
-  last_error: null,    // string
+  last_run_at: null, // ISO string
+  last_error: null,  // string
 };
-let notifyTimer = null;
+
+// scheduler state (setTimeout loop)
+let notifyTimer = null;        // timeout handle
+let notifyNextRunAtMs = null;  // ms timestamp
 
 if (!TOKEN || !GUILD_ID || !ADMIN_ROLE_ID || !CLIENT_ID) {
   console.error("Missing env vars: DISCORD_BOT_TOKEN / DISCORD_GUILD_ID / DISCORD_ADMIN_ROLE_ID / DISCORD_CLIENT_ID");
@@ -95,6 +104,180 @@ function safeMkdirp(dir, mode = 0o700) {
   }
 }
 
+/* =========================
+ * HELP PANEL (row buttons)
+ * ========================= */
+function buildHelpButtons(activeTab) {
+  activeTab = String(activeTab || "overview").toLowerCase().trim();
+  if (!HELP_TABS.includes(activeTab)) activeTab = "overview";
+
+  const mk = (tab, label, emoji) => {
+    const active = activeTab === tab;
+    return new ButtonBuilder()
+      .setCustomId(`help:tab:${tab}`)
+      .setLabel(label)
+      .setEmoji(emoji)
+      .setStyle(active ? ButtonStyle.Primary : ButtonStyle.Secondary);
+  };
+
+  const row1 = new ActionRowBuilder().addComponents(
+    mk("overview", "Overview", "📘"),
+    mk("accounts", "Accounts", "📚"),
+    mk("add", "Add", "➕"),
+    mk("del", "Delete", "🗑️"),
+    mk("notify", "Notify", "🛎️"),
+  );
+
+  const row2 = new ActionRowBuilder().addComponents(
+    mk("ping", "Ping", "🏓"),
+    mk("status", "Status", "🧩"),
+  );
+
+  return [row1, row2];
+}
+
+function buildHelpEmbed(tab) {
+  tab = String(tab || "overview").toLowerCase().trim();
+  if (!HELP_TABS.includes(tab)) tab = "overview";
+
+  const e = new EmbedBuilder().setTitle("📘 XRAY Discord Bot Help");
+
+  if (tab === "overview") {
+    e.setDescription(
+      [
+        "**Ringkasan**",
+        "- Bot UI (Node.js) hanya mengirim perintah ke backend via IPC (UNIX socket).",
+        "- Backend yang melakukan perubahan Xray & filesystem yang sensitif.",
+        "",
+        "**Hak akses**",
+        "- Admin only: `/accounts`, `/add`, `/del`, `/notify`, `/status`",
+        "- Publik: `/ping`, `/help`",
+        "",
+        "**Aturan username**",
+        "- Username hanya: `[A-Za-z0-9_]` (tanpa suffix)",
+        "- Bot akan menambahkan suffix: `@vless/@vmess/@trojan/@allproto`",
+      ].join("\n")
+    );
+    e.setFooter({ text: "Gunakan tombol tab di bawah untuk melihat cara pakai tiap command." });
+    return e;
+  }
+
+  if (tab === "accounts") {
+    e.setDescription(
+      [
+        "**/accounts (Admin only)**",
+        "",
+        "**Cara pakai:**",
+        "1) Jalankan `/accounts` untuk melihat daftar akun",
+        "2) Gunakan **filter buttons** untuk memilih protocol (ALL/VLESS/VMESS/TROJAN/ALLPROTO)",
+        "3) Pilih user dari dropdown → bot mengirim ulang file **XRAY ACCOUNT DETAIL (.txt)**",
+        "",
+        "**Catatan:**",
+        "- Table hanya menampilkan **No & Username** untuk tampilan yang bersih",
+        "- Paging pakai tombol Prev/Next",
+      ].join("\n")
+    );
+    return e;
+  }
+
+  if (tab === "add") {
+    e.setDescription(
+      [
+        "**/add (Admin only)**",
+        "",
+        "**Cara pakai:**",
+        "1) Jalankan `/add` → muncul tombol protocol",
+        "2) Klik protocol (VLESS/VMESS/TROJAN/ALLPROTO)",
+        "3) Isi form: `username`, `days`, `quota_gb`",
+        "4) Jika sukses: bot attach file **.txt** detail akun + tombol resend",
+        "",
+        "**Validasi:**",
+        "- Username wajib `[A-Za-z0-9_]`",
+        "- Days: 1..3650",
+        "- Quota: 0 = unlimited",
+      ].join("\n")
+    );
+    return e;
+  }
+
+  if (tab === "del") {
+    e.setDescription(
+      [
+        "**/del (Admin only)**",
+        "",
+        "**Mode 1 (List UI):**",
+        "1) Jalankan `/del` → tampil table + filter buttons",
+        "2) Pilih user dari dropdown → muncul confirm/cancel",
+        "3) Klik **Confirm Delete** untuk menghapus",
+        "",
+        "**Mode 2 (Direct confirm):**",
+        "- `/del protocol:<proto> username:<user>` → langsung tampil confirm/cancel",
+      ].join("\n")
+    );
+    return e;
+  }
+
+  if (tab === "notify") {
+    e.setDescription(
+      [
+        "**/notify (Admin only)**",
+        "",
+        "**Panel notifikasi berkala (Ping + Status):**",
+        "1) Jalankan `/notify` → panel + tombol",
+        "2) Klik **Set Channel** → pilih channel notifikasi (mis. `#notifikasi`)",
+        "3) Klik **Set Interval** → isi menit (min 1, bisa sangat besar/unlimited)",
+        "4) Klik **Enable/Disable** untuk toggle",
+        "5) Klik **Test Now** untuk kirim 1x sekarang",
+        "",
+        "**Catatan:**",
+        "- Notifikasi dikirim dalam format **text-only** agar stabil di dark/light mode",
+      ].join("\n")
+    );
+    return e;
+  }
+
+  if (tab === "ping") {
+    e.setDescription(
+      [
+        "**/ping (Publik)**",
+        "",
+        "**Fungsi:**",
+        "- Health check bot + latency backend IPC (ms)",
+        "",
+        "**Output:** text-only (codeblock) untuk menghindari dual rendering.",
+      ].join("\n")
+    );
+    return e;
+  }
+
+  if (tab === "status") {
+    e.setDescription(
+      [
+        "**/status (Admin only)**",
+        "",
+        "**Fungsi:**",
+        "- Menampilkan status service `xray` dan `nginx` (hasil dari backend)",
+        "",
+        "**Output:** text-only (codeblock) agar jelas di dark/light mode.",
+      ].join("\n")
+    );
+    return e;
+  }
+
+  // fallback
+  e.setDescription("Help tab not found.");
+  return e;
+}
+
+function buildHelpPanel(activeTab) {
+  const embed = buildHelpEmbed(activeTab);
+  const components = buildHelpButtons(activeTab);
+  return { embeds: [embed], components };
+}
+
+/* =========================
+ * NOTIFY persistence
+ * ========================= */
 function loadNotifyCfg() {
   try {
     if (!fs.existsSync(NOTIFY_STATE_PATH)) return;
@@ -131,22 +314,47 @@ function saveNotifyCfg() {
 }
 
 function stopNotifyScheduler() {
-  if (notifyTimer) clearInterval(notifyTimer);
+  if (notifyTimer) clearTimeout(notifyTimer);
   notifyTimer = null;
+  notifyNextRunAtMs = null;
 }
 
 function canRunNotify() {
   return notifyCfg.enabled && notifyCfg.channel_id && notifyCfg.interval_min >= NOTIFY_MIN_INTERVAL_MIN;
 }
 
+function scheduleNotifyLoop(client) {
+  if (!canRunNotify()) return;
+
+  // set run pertama jika belum ada
+  if (!notifyNextRunAtMs) {
+    notifyNextRunAtMs = Date.now() + (notifyCfg.interval_min * 60 * 1000);
+  }
+
+  const now = Date.now();
+  const delayMs = Math.max(0, notifyNextRunAtMs - now);
+
+  // setTimeout maksimal terbatas, jadi kita “chunk”
+  const waitMs = Math.min(delayMs, NOTIFY_MAX_TIMEOUT_MS);
+
+  notifyTimer = setTimeout(async () => {
+    if (!canRunNotify()) return;
+
+    // Kalau sudah waktunya run
+    if (Date.now() >= notifyNextRunAtMs - 1000) {
+      await sendNotifyTick(client).catch(() => {});
+      // jadwalkan run berikutnya
+      notifyNextRunAtMs = Date.now() + (notifyCfg.interval_min * 60 * 1000);
+    }
+
+    scheduleNotifyLoop(client);
+  }, waitMs);
+}
+
 function startNotifyScheduler(client) {
   stopNotifyScheduler();
   if (!canRunNotify()) return;
-
-  const ms = notifyCfg.interval_min * 60 * 1000;
-  notifyTimer = setInterval(() => {
-    sendNotifyTick(client).catch(() => {});
-  }, ms);
+  scheduleNotifyLoop(client);
 }
 
 function buildNotifyMessageText({ wsMs, ipcMs, xrayState, nginxState, error }) {
@@ -175,8 +383,9 @@ function buildNotifyMessageText({ wsMs, ipcMs, xrayState, nginxState, error }) {
   return lines.join("\n");
 }
 
-async function sendNotifyTick(client) {
-  if (!canRunNotify()) return;
+async function sendNotifyTick(client, { force = false } = {}) {
+  if (!force && !canRunNotify()) return;
+  if (!notifyCfg.channel_id) return;
 
   const channelId = String(notifyCfg.channel_id);
   const ch = await client.channels.fetch(channelId).catch(() => null);
@@ -237,6 +446,9 @@ async function sendNotifyTick(client) {
   }
 }
 
+/* =========================
+ * Backend IPC
+ * ========================= */
 function callBackend(req) {
   return new Promise((resolve, reject) => {
     const client = net.createConnection(SOCK_PATH);
@@ -408,7 +620,7 @@ function buildNotifyPanel({ extraRow } = {}) {
       [
         "**Cara pakai:**",
         "1) Klik **Set Channel** → pilih channel notifikasi",
-        "2) Klik **Set Interval** (menit)",
+        `2) Klik **Set Interval** (menit) — bisa ${NOTIFY_MIN_INTERVAL_MIN} menit s/d unlimited`,
         "3) Klik **Enable/Disable** untuk toggle",
         "4) Klik **Test Now** untuk kirim 1x sekarang",
       ].join("\n")
@@ -625,7 +837,7 @@ function buildAddModal(protocol) {
 
 async function registerCommands() {
   const commands = [
-    new SlashCommandBuilder().setName("help").setDescription("Cara pakai bot & penjelasan fungsi"),
+    new SlashCommandBuilder().setName("help").setDescription("Cara pakai bot & penjelasan fungsi (UI interaktif)"),
     new SlashCommandBuilder().setName("ping").setDescription("Health check bot + backend latency (ms)"),
     new SlashCommandBuilder().setName("status").setDescription("Status service Xray dan Nginx (admin only)"),
 
@@ -708,7 +920,12 @@ client.on("interactionCreate", async (interaction) => {
         startNotifyScheduler(client);
 
         const panel = buildNotifyPanel();
-        return interaction.reply({ ...panel, ephemeral: true });
+        await interaction.reply({ ...panel, ephemeral: true });
+
+        return interaction.followUp({
+          content: `✅ Interval notifikasi berhasil disetel ke **${minutes} menit**.`,
+          ephemeral: true
+        });
       }
 
       // add modal
@@ -809,7 +1026,12 @@ client.on("interactionCreate", async (interaction) => {
       startNotifyScheduler(client);
 
       const panel = buildNotifyPanel();
-      return interaction.update({ ...panel });
+      await interaction.update({ ...panel });
+
+      return interaction.followUp({
+        content: `✅ Notifikasi berhasil disetel ke <#${selected}>.`,
+        ephemeral: true
+      });
     } catch (e) {
       console.error(e);
       return interaction.reply({ content: `❌ ${mapBackendError(e)}`, ephemeral: true });
@@ -907,6 +1129,13 @@ client.on("interactionCreate", async (interaction) => {
 
       const customId = String(interaction.customId || "");
 
+      // ✅ HELP TAB BUTTONS (public)
+      if (customId.startsWith("help:tab:")) {
+        const tab = customId.split(":")[2] || "overview";
+        const panel = buildHelpPanel(tab);
+        return interaction.update({ ...panel });
+      }
+
       // /notify buttons (admin only)
       if (customId.startsWith("notify:")) {
         if (!isAdmin(interaction.member)) {
@@ -980,7 +1209,7 @@ client.on("interactionCreate", async (interaction) => {
           }
 
           // send 1x now (even if disabled)
-          await sendNotifyTick(client).catch((e) => {
+          await sendNotifyTick(client, { force: true }).catch((e) => {
             notifyCfg.last_error = mapBackendError(e);
             saveNotifyCfg();
           });
@@ -993,7 +1222,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "❌ Unknown notify action", ephemeral: true });
       }
 
-      // /help tabs are unchanged (if you use them elsewhere); keep minimal stable behavior
       // ✅ /add protocol selector buttons
       if (customId.startsWith("addproto:")) {
         if (!isAdmin(interaction.member)) {
@@ -1161,23 +1389,10 @@ client.on("interactionCreate", async (interaction) => {
 
   const cmd = interaction.commandName;
 
+  // ✅ /help now uses row filter buttons (interactive UI)
   if (cmd === "help") {
-    const embed = new EmbedBuilder()
-      .setTitle("📘 XRAY Discord Bot Help")
-      .setDescription("Bot ini untuk manajemen akun Xray via backend service (IPC).")
-      .addFields(
-        { name: "/add", value: "Buat akun: pilih protocol via button, lalu isi form (username/days/quota). **Admin only**", inline: false },
-        { name: "/del", value: "Hapus akun via list+pilih+confirm. Atau isi protocol+username untuk confirm langsung. **Admin only**", inline: false },
-        { name: "/accounts", value: "List akun (paging) + pilih untuk ambil ulang detail (.txt). **Admin only**", inline: false },
-        { name: "/notify", value: "Panel notifikasi berkala Ping+Status (set channel, interval, enable/disable). **Admin only**", inline: false },
-        { name: "/ping", value: "Cek bot hidup + latency backend (ms).", inline: false },
-        { name: "/status", value: "Lihat status service Xray & Nginx. **Admin only**", inline: false },
-        { name: "Aturan username", value: "`[A-Za-z0-9_]` (tanpa suffix). Bot akan menambahkan `@vless/@vmess/@trojan/@allproto`.", inline: false },
-        { name: "Quota", value: "`quota_gb=0` berarti Unlimited.", inline: false }
-      )
-      .setFooter({ text: "Tip: Jika error socket/backend, cek /status (admin) atau journalctl xray-backend." });
-
-    return interaction.reply({ embeds: [embed], ephemeral: true });
+    const panel = buildHelpPanel("overview");
+    return interaction.reply({ ...panel, ephemeral: true });
   }
 
   // /ping (content-only)
