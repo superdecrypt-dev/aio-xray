@@ -233,14 +233,23 @@ async function buildListMessage(kind, protoFilter, offset) {
   const hasMore = !!resp.has_more;
 
   const title = kind === "del" ? "🗑️ Delete Accounts" : "📚 XRAY Accounts";
-  const desc = items.length ? formatAccountsTable(items) : "Tidak ada akun ditemukan.";
+  const prefix = kind === "del" ? "del" : "acct";
 
+  // ✅ Table moved to CONTENT (more stable in dark/light)
+  const headerLine =
+    kind === "del"
+      ? "🗑️ Delete mode — pilih akun dari dropdown, lalu konfirmasi."
+      : "📚 Accounts — pilih akun dari dropdown untuk ambil ulang XRAY ACCOUNT DETAIL (.txt).";
+
+  const tableBlock = items.length ? formatAccountsTable(items) : "Tidak ada akun ditemukan.";
+
+  // Embed now only for title + footer (no heavy text)
   const embed = new EmbedBuilder()
     .setTitle(title)
-    .setDescription(desc)
+    .setDescription(kind === "del"
+      ? "Pilih akun → akan muncul tombol **Confirm Delete / Cancel**."
+      : "Pilih akun → bot akan meng-attach ulang file **.txt**.")
     .setFooter({ text: `Filter: ${protoFilter} | Showing ${items.length} of ${total} | Offset ${offset}` });
-
-  const prefix = kind === "del" ? "del" : "acct";
 
   const nav = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -288,9 +297,8 @@ async function buildListMessage(kind, protoFilter, offset) {
     components.unshift(new ActionRowBuilder().addComponents(menu));
   }
 
-  const content = kind === "del"
-    ? (items.length ? "🗑️ Delete mode — pilih akun dari dropdown, lalu konfirmasi." : "🗑️ Delete mode — tidak ada akun.")
-    : (items.length ? "📚 XRAY Accounts — pilih dari dropdown untuk ambil ulang file .txt" : "📚 XRAY Accounts — tidak ada akun.");
+  // ✅ Content includes the table codeblock
+  const content = `${headerLine}\n${tableBlock}`;
 
   return { content, embeds: [embed], components, ephemeral: true };
 }
