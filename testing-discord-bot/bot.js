@@ -153,44 +153,28 @@ function buildDetailTxtPath(proto, finalEmail) {
   return path.join(baseDir, `${finalEmail}.txt`);
 }
 
-function buildPingPayload(wsMs, ipcMs) {
-  const embed = new EmbedBuilder()
-    .setTitle("🏓 Pong")
-    .addFields(
-      { name: "Bot", value: "🟢 OK", inline: true },
-      { name: "Discord WS", value: `${wsMs} ms`, inline: true },
-      { name: "Backend IPC", value: `${ipcMs} ms`, inline: true },
-    )
-    .setFooter({ text: "Latency = round-trip IPC ke backend." });
-
-  const content =
-    `🏓 Pong\n` +
-    `Discord WS: ${wsMs} ms\n` +
-    `Backend IPC: ${ipcMs} ms`;
-
-  return { content, embeds: [embed], ephemeral: true };
+// ✅ TEXT-ONLY (NO EMBED) for /ping & /status
+function buildPingText(wsMs, ipcMs) {
+  return (
+    "```" +
+    "\n🏓 Pong" +
+    `\nDiscord WS : ${wsMs} ms` +
+    `\nBackend IPC: ${ipcMs} ms` +
+    "\n```"
+  );
 }
 
-function buildStatusPayload(xrayState, nginxState, ipcMs) {
+function buildStatusText(xrayState, nginxState, ipcMs) {
   const xray = badge(xrayState);
   const nginx = badge(nginxState);
-
-  const embed = new EmbedBuilder()
-    .setTitle("🧩 Service Status")
-    .addFields(
-      { name: "Xray", value: xray, inline: true },
-      { name: "Nginx", value: nginx, inline: true },
-      { name: "Backend IPC", value: `${ipcMs} ms`, inline: true }
-    )
-    .setFooter({ text: "Status diambil oleh backend via systemctl is-active." });
-
-  const content =
-    `🧩 Service Status\n` +
-    `Xray : ${xray}\n` +
-    `Nginx: ${nginx}\n` +
-    `IPC  : ${ipcMs} ms`;
-
-  return { content, embeds: [embed], ephemeral: true };
+  return (
+    "```" +
+    "\n🧩 Service Status" +
+    `\nXray : ${xray}` +
+    `\nNginx: ${nginx}` +
+    `\nIPC  : ${ipcMs} ms` +
+    "\n```"
+  );
 }
 
 function formatAccountsTable(items) {
@@ -243,7 +227,7 @@ async function buildListMessage(kind, protoFilter, offset) {
 
   const tableBlock = items.length ? formatAccountsTable(items) : "Tidak ada akun ditemukan.";
 
-  // Embed now only for title + footer (no heavy text)
+  // Embed only for title/summary (no table)
   const embed = new EmbedBuilder()
     .setTitle(title)
     .setDescription(kind === "del"
@@ -297,9 +281,7 @@ async function buildListMessage(kind, protoFilter, offset) {
     components.unshift(new ActionRowBuilder().addComponents(menu));
   }
 
-  // ✅ Content includes the table codeblock
   const content = `${headerLine}\n${tableBlock}`;
-
   return { content, embeds: [embed], components, ephemeral: true };
 }
 
@@ -339,9 +321,6 @@ async function registerCommands() {
       .addIntegerOption(o => o.setName("days").setDescription("masa aktif (hari)").setRequired(true))
       .addNumberOption(o => o.setName("quota_gb").setDescription("quota (GB), 0=unlimited").setRequired(true)),
 
-    // /del: bisa dua mode
-    // - Mode A (interactive): tanpa username => tampil list + pilih + confirm
-    // - Mode B (direct): protocol+username => confirm seperti sebelumnya
     new SlashCommandBuilder()
       .setName("del")
       .setDescription("Delete Xray user (list & confirm) (admin only)")
@@ -429,7 +408,6 @@ client.on("interactionCreate", async (interaction) => {
         const parsed = parseFinalEmail(selected);
         if (!parsed) return interaction.reply({ content: "❌ Invalid target", ephemeral: true });
 
-        // Reuse existing confirm button format: delconfirm:<proto>:<baseUser>
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder()
             .setCustomId(`delconfirm:${parsed.proto}:${parsed.base}`)
@@ -450,7 +428,6 @@ client.on("interactionCreate", async (interaction) => {
           )
           .setFooter({ text: "Ini akan menghapus user dari config + metadata files." });
 
-        // Use update (replace list UI with confirm UI)
         return interaction.update({
           content: `⚠️ Confirm delete: ${parsed.final}`,
           embeds: [embed],
@@ -482,8 +459,6 @@ client.on("interactionCreate", async (interaction) => {
       const customId = String(interaction.customId || "");
 
       // paging buttons for accounts/delete lists
-      // acct:<prev|ref|next>:<protoFilter>:<offset>
-      // del:<prev|ref|next>:<protoFilter>:<offset>
       if (customId.startsWith("acct:") || customId.startsWith("del:")) {
         const parts = customId.split(":");
         if (parts.length !== 4) return interaction.reply({ content: "❌ Invalid button", ephemeral: true });
@@ -609,7 +584,7 @@ client.on("interactionCreate", async (interaction) => {
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
 
-  // /ping is read-only, open to guild members
+  // /ping is read-only, open to guild members (TEXT ONLY)
   if (cmd === "ping") {
     try {
       const wsMs = Math.round(client.ws.ping);
@@ -627,7 +602,7 @@ client.on("interactionCreate", async (interaction) => {
           return interaction.reply({ content: `❌ Backend ping failed: ${msg}`, ephemeral: true });
         }
         const ipcMs = Date.now() - t0;
-        return interaction.reply(buildPingPayload(wsMs, ipcMs));
+        return interaction.reply({ content: buildPingText(wsMs, ipcMs), ephemeral: true });
       }
 
       await interaction.deferReply({ ephemeral: true });
@@ -636,8 +611,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(`❌ Backend ping failed: ${resp.error || "unknown error"}`);
       }
       const ipcMs = Date.now() - t0;
-      const payload = buildPingPayload(wsMs, ipcMs);
-      return interaction.editReply({ content: payload.content, embeds: payload.embeds });
+      return interaction.editReply({ content: buildPingText(wsMs, ipcMs) });
     } catch (e) {
       console.error(e);
       const msg = mapBackendError(e);
@@ -651,7 +625,7 @@ client.on("interactionCreate", async (interaction) => {
     return interaction.reply({ content: "❌ Unauthorized (admin role required).", ephemeral: true });
   }
 
-  // /status (admin-only)
+  // /status (admin-only) (TEXT ONLY)
   if (cmd === "status") {
     try {
       const t0 = Date.now();
@@ -668,7 +642,7 @@ client.on("interactionCreate", async (interaction) => {
           return interaction.reply({ content: `❌ Failed: ${msg}`, ephemeral: true });
         }
         const ipcMs = Date.now() - t0;
-        return interaction.reply(buildStatusPayload(quick.r.xray, quick.r.nginx, ipcMs));
+        return interaction.reply({ content: buildStatusText(quick.r.xray, quick.r.nginx, ipcMs), ephemeral: true });
       }
 
       await interaction.deferReply({ ephemeral: true });
@@ -677,8 +651,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(`❌ Failed: ${resp.error || "unknown error"}`);
       }
       const ipcMs = Date.now() - t0;
-      const payload = buildStatusPayload(resp.xray, resp.nginx, ipcMs);
-      return interaction.editReply({ content: payload.content, embeds: payload.embeds });
+      return interaction.editReply({ content: buildStatusText(resp.xray, resp.nginx, ipcMs) });
     } catch (e) {
       console.error(e);
       const msg = mapBackendError(e);
