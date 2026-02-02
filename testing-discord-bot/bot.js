@@ -15,7 +15,9 @@ const {
   ButtonStyle,
   ModalBuilder,
   TextInputBuilder,
-  TextInputStyle
+  TextInputStyle,
+  ChannelSelectMenuBuilder,
+  ChannelType,
 } = require("discord.js");
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN;
@@ -33,6 +35,20 @@ const PAGE_SIZE = 25; // Discord select menu max options
 const ADD_PROTOCOLS = ["vless", "vmess", "trojan", "allproto"];
 const LIST_PROTOCOLS = ["all", "vless", "vmess", "trojan", "allproto"];
 const HELP_TABS = ["overview", "accounts", "add", "del", "ping", "status"];
+
+// /notify state (persist)
+const NOTIFY_STATE_PATH = "/opt/xray-discord-bot/state/notify.json";
+const NOTIFY_MIN_INTERVAL_MIN = 5;
+const NOTIFY_MAX_INTERVAL_MIN = 10080; // 7 days
+
+let notifyCfg = {
+  enabled: false,
+  channel_id: null,
+  interval_min: 60,
+  last_run_at: null,   // ISO string
+  last_error: null,    // string
+};
+let notifyTimer = null;
 
 if (!TOKEN || !GUILD_ID || !ADMIN_ROLE_ID || !CLIENT_ID) {
   console.error("Missing env vars: DISCORD_BOT_TOKEN / DISCORD_GUILD_ID / DISCORD_ADMIN_ROLE_ID / DISCORD_CLIENT_ID");
@@ -68,6 +84,157 @@ function clampInt(n, min, max) {
   if (n < min) return min;
   if (n > max) return max;
   return n;
+}
+
+function safeMkdirp(dir, mode = 0o700) {
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function loadNotifyCfg() {
+  try {
+    if (!fs.existsSync(NOTIFY_STATE_PATH)) return;
+    const raw = fs.readFileSync(NOTIFY_STATE_PATH, "utf8");
+    const obj = JSON.parse(raw);
+
+    notifyCfg.enabled = !!obj.enabled;
+    notifyCfg.channel_id = obj.channel_id ? String(obj.channel_id) : null;
+
+    const iv = Number(obj.interval_min);
+    notifyCfg.interval_min = Number.isFinite(iv)
+      ? clampInt(iv, NOTIFY_MIN_INTERVAL_MIN, NOTIFY_MAX_INTERVAL_MIN)
+      : 60;
+
+    notifyCfg.last_run_at = obj.last_run_at ? String(obj.last_run_at) : null;
+    notifyCfg.last_error = obj.last_error ? String(obj.last_error) : null;
+  } catch (e) {
+    // keep defaults
+  }
+}
+
+function saveNotifyCfg() {
+  try {
+    const dir = path.dirname(NOTIFY_STATE_PATH);
+    if (!safeMkdirp(dir, 0o700)) return false;
+
+    const tmp = `${NOTIFY_STATE_PATH}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(notifyCfg, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, NOTIFY_STATE_PATH);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function stopNotifyScheduler() {
+  if (notifyTimer) clearInterval(notifyTimer);
+  notifyTimer = null;
+}
+
+function canRunNotify() {
+  return notifyCfg.enabled && notifyCfg.channel_id && notifyCfg.interval_min >= NOTIFY_MIN_INTERVAL_MIN;
+}
+
+function startNotifyScheduler(client) {
+  stopNotifyScheduler();
+  if (!canRunNotify()) return;
+
+  const ms = notifyCfg.interval_min * 60 * 1000;
+  notifyTimer = setInterval(() => {
+    sendNotifyTick(client).catch(() => {});
+  }, ms);
+}
+
+function buildNotifyMessageText({ wsMs, ipcMs, xrayState, nginxState, error }) {
+  const ts = new Date().toISOString();
+  const lines = [];
+  lines.push("```");
+  lines.push("🛎️ NOTIFIKASI XRAY (Berkala)");
+  lines.push(`Waktu: ${ts}`);
+  lines.push("");
+
+  if (error) {
+    lines.push("❌ ERROR");
+    lines.push(String(error).slice(0, 900));
+    lines.push("```");
+    return lines.join("\n");
+  }
+
+  lines.push("🏓 Ping");
+  lines.push(`Discord WS : ${wsMs} ms`);
+  lines.push(`Backend IPC: ${ipcMs} ms`);
+  lines.push("");
+  lines.push("🧩 Status");
+  lines.push(`Xray : ${badge(xrayState)}`);
+  lines.push(`Nginx: ${badge(nginxState)}`);
+  lines.push("```");
+  return lines.join("\n");
+}
+
+async function sendNotifyTick(client) {
+  if (!canRunNotify()) return;
+
+  const channelId = String(notifyCfg.channel_id);
+  const ch = await client.channels.fetch(channelId).catch(() => null);
+  if (!ch || !ch.isTextBased()) {
+    notifyCfg.last_error = `Channel invalid / not text-based: ${channelId}`;
+    saveNotifyCfg();
+    return;
+  }
+
+  const wsMs = Math.round(client.ws.ping);
+  const t0 = Date.now();
+
+  try {
+    const pingResp = await callBackend({ action: "ping" });
+    const statusResp = await callBackend({ action: "status" });
+    const ipcMs = Date.now() - t0;
+
+    if (!pingResp || pingResp.status !== "ok") {
+      const msg = pingResp && pingResp.error ? pingResp.error : "backend ping failed";
+      notifyCfg.last_error = msg;
+      notifyCfg.last_run_at = new Date().toISOString();
+      saveNotifyCfg();
+
+      await ch.send({ content: buildNotifyMessageText({ wsMs, ipcMs, error: msg }) });
+      return;
+    }
+
+    if (!statusResp || statusResp.status !== "ok") {
+      const msg = statusResp && statusResp.error ? statusResp.error : "backend status failed";
+      notifyCfg.last_error = msg;
+      notifyCfg.last_run_at = new Date().toISOString();
+      saveNotifyCfg();
+
+      await ch.send({ content: buildNotifyMessageText({ wsMs, ipcMs, error: msg }) });
+      return;
+    }
+
+    notifyCfg.last_error = null;
+    notifyCfg.last_run_at = new Date().toISOString();
+    saveNotifyCfg();
+
+    await ch.send({
+      content: buildNotifyMessageText({
+        wsMs,
+        ipcMs,
+        xrayState: statusResp.xray,
+        nginxState: statusResp.nginx
+      })
+    });
+  } catch (e) {
+    const msg = mapBackendError(e);
+    notifyCfg.last_error = msg;
+    notifyCfg.last_run_at = new Date().toISOString();
+    saveNotifyCfg();
+    try {
+      await ch.send({ content: buildNotifyMessageText({ wsMs: Math.round(client.ws.ping), ipcMs: 0, error: msg }) });
+    } catch (_) {}
+  }
 }
 
 function callBackend(req) {
@@ -159,7 +326,7 @@ function buildDetailTxtPath(proto, finalEmail) {
   return path.join(baseDir, `${finalEmail}.txt`);
 }
 
-// ✅ /ping & /status tetap content-only (tidak diminta berubah)
+// /ping & /status content-only
 function buildPingText(wsMs, ipcMs) {
   return (
     "```" +
@@ -184,8 +351,7 @@ function buildStatusText(xrayState, nginxState, ipcMs) {
 }
 
 /**
- * ✅ UPDATED TABLE: only No & Username
- * Used by /accounts list and /del list
+ * ✅ TABLE only No & Username (for /accounts and /del list)
  */
 function formatAccountsTable(items) {
   const header = "No  Username";
@@ -193,7 +359,6 @@ function formatAccountsTable(items) {
   for (let i = 0; i < items.length; i++) {
     const it = items[i] || {};
     const no = String(i + 1).padEnd(3, " ");
-    // keep username width reasonable for embed; truncate for safety
     const user = String(it.username || "-").slice(0, 40);
     lines.push(`${no}${user}`);
   }
@@ -228,144 +393,98 @@ function buildProtocolFilterRow(prefix, active) {
 }
 
 /**
- * /help row filter buttons (tabs)
- * max 5 per row, so we use 5 tabs: accounts/add/del/ping/status
- * "overview" is default shown when /help invoked.
+ * /notify panel UI
  */
-function buildHelpTabRow(activeTab) {
-  activeTab = String(activeTab || "overview").toLowerCase().trim();
-  if (!HELP_TABS.includes(activeTab)) activeTab = "overview";
+function buildNotifyPanel({ extraRow } = {}) {
+  const status = notifyCfg.enabled ? "🟢 ON" : "🔴 OFF";
+  const ch = notifyCfg.channel_id ? `<#${notifyCfg.channel_id}>` : "`(belum diatur)`";
+  const iv = `${notifyCfg.interval_min} menit`;
+  const lastRun = notifyCfg.last_run_at ? `\`${notifyCfg.last_run_at}\`` : "`-`";
+  const lastErr = notifyCfg.last_error ? `\`${String(notifyCfg.last_error).slice(0, 180)}\`` : "`-`";
 
-  const mk = (tab, label, emoji) => {
-    const isActive = activeTab === tab;
-    return new ButtonBuilder()
-      .setCustomId(`help:tab:${tab}`)
-      .setLabel(label)
-      .setEmoji(emoji)
-      .setStyle(isActive ? ButtonStyle.Primary : ButtonStyle.Secondary);
-  };
+  const embed = new EmbedBuilder()
+    .setTitle("🛎️ Notify Panel")
+    .setDescription(
+      [
+        "**Cara pakai:**",
+        "1) Klik **Set Channel** → pilih channel notifikasi",
+        "2) Klik **Set Interval** (menit)",
+        "3) Klik **Enable/Disable** untuk toggle",
+        "4) Klik **Test Now** untuk kirim 1x sekarang",
+      ].join("\n")
+    )
+    .addFields(
+      { name: "Status", value: status, inline: true },
+      { name: "Channel", value: ch, inline: true },
+      { name: "Interval", value: iv, inline: true },
+      { name: "Last Run", value: lastRun, inline: false },
+      { name: "Last Error", value: lastErr, inline: false },
+    )
+    .setFooter({ text: "Notifikasi berkala mengirim Ping + Status (text-only) ke channel target." });
 
-  // exactly 5 buttons
-  return new ActionRowBuilder().addComponents(
-    mk("accounts", "Accounts", "📚"),
-    mk("add", "Add", "➕"),
-    mk("del", "Del", "🗑️"),
-    mk("ping", "Ping", "🏓"),
-    mk("status", "Status", "🧩"),
-  );
+  const toggleBtn = new ButtonBuilder()
+    .setCustomId("notify:toggle")
+    .setLabel(notifyCfg.enabled ? "Disable" : "Enable")
+    .setStyle(notifyCfg.enabled ? ButtonStyle.Danger : ButtonStyle.Success)
+    .setEmoji(notifyCfg.enabled ? "🛑" : "✅");
+
+  const testBtn = new ButtonBuilder()
+    .setCustomId("notify:test")
+    .setLabel("Test Now")
+    .setStyle(ButtonStyle.Secondary)
+    .setEmoji("🧪");
+
+  const refreshBtn = new ButtonBuilder()
+    .setCustomId("notify:refresh")
+    .setLabel("Refresh")
+    .setStyle(ButtonStyle.Secondary)
+    .setEmoji("🔄");
+
+  const setChannelBtn = new ButtonBuilder()
+    .setCustomId("notify:set_channel")
+    .setLabel("Set Channel")
+    .setStyle(ButtonStyle.Primary)
+    .setEmoji("📌");
+
+  const setIntervalBtn = new ButtonBuilder()
+    .setCustomId("notify:set_interval")
+    .setLabel("Set Interval")
+    .setStyle(ButtonStyle.Primary)
+    .setEmoji("⏱️");
+
+  const row1 = new ActionRowBuilder().addComponents(toggleBtn, testBtn, refreshBtn);
+  const row2 = new ActionRowBuilder().addComponents(setChannelBtn, setIntervalBtn);
+
+  const components = [row1, row2];
+  if (extraRow) components.splice(1, 0, extraRow); // insert between row1 and row2
+  return { embeds: [embed], components };
 }
 
-function buildHelpEmbed(tab) {
-  tab = String(tab || "overview").toLowerCase().trim();
-  if (!HELP_TABS.includes(tab)) tab = "overview";
+function buildNotifyChannelSelectRow() {
+  const menu = new ChannelSelectMenuBuilder()
+    .setCustomId("notify:channel_select")
+    .setPlaceholder("Pilih channel notifikasi…")
+    .setMinValues(1)
+    .setMaxValues(1)
+    .setChannelTypes([ChannelType.GuildText, ChannelType.GuildAnnouncement]);
 
-  const e = new EmbedBuilder().setTitle("📘 XRAY Discord Bot Help");
+  return new ActionRowBuilder().addComponents(menu);
+}
 
-  if (tab === "overview") {
-    e.setDescription(
-      [
-        "Bot ini untuk manajemen akun Xray via backend service (IPC).",
-        "",
-        "Pilih tab di bawah untuk melihat detail per command.",
-        "",
-        "**Catatan role:** beberapa command hanya bisa dipakai admin (ADMIN_ROLE_ID).",
-      ].join("\n")
-    );
-    e.addFields(
-      { name: "/accounts", value: "List akun + pilih untuk ambil ulang detail .txt (admin only)", inline: false },
-      { name: "/add", value: "Buat akun (protocol via button → modal) (admin only)", inline: false },
-      { name: "/del", value: "Hapus akun (list+confirm atau direct confirm) (admin only)", inline: false },
-      { name: "/ping", value: "Health check bot + backend latency", inline: false },
-      { name: "/status", value: "Status service Xray & Nginx (admin only)", inline: false },
-    );
-    e.setFooter({ text: "Tip: Jika backend/socket error → cek xray-backend.service dan file socket /run/xray-backend.sock" });
-    return e;
-  }
+function buildNotifyIntervalModal() {
+  const modal = new ModalBuilder()
+    .setCustomId("notify:interval_modal")
+    .setTitle("Set Interval Notifikasi (menit)");
 
-  if (tab === "accounts") {
-    e.setDescription(
-      [
-        "**/accounts** (admin only)",
-        "",
-        "Menampilkan daftar akun (tabel: No & Username) + dropdown untuk pilih akun.",
-        "Filter protocol dilakukan via tombol filter (ALL/VLESS/VMESS/TROJAN/ALLPROTO).",
-        "",
-        "Langkah:",
-        "1) Jalankan `/accounts`",
-        "2) (Opsional) klik tombol filter protocol",
-        "3) Pilih akun dari dropdown → bot attach ulang file **XRAY ACCOUNT DETAIL (.txt)**",
-      ].join("\n")
-    );
-    return e;
-  }
+  const minutesInput = new TextInputBuilder()
+    .setCustomId("minutes")
+    .setLabel(`Interval (menit) ${NOTIFY_MIN_INTERVAL_MIN}..${NOTIFY_MAX_INTERVAL_MIN}`)
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setPlaceholder("60");
 
-  if (tab === "add") {
-    e.setDescription(
-      [
-        "**/add** (admin only)",
-        "",
-        "Flow interaktif:",
-        "1) Jalankan `/add`",
-        "2) Pilih protocol via button",
-        "3) Isi modal: username (tanpa suffix), days, quota_gb",
-        "",
-        "Aturan:",
-        "- username valid: `[A-Za-z0-9_]`",
-        "- quota_gb: `0` = unlimited",
-        "",
-        "Hasil sukses:",
-        "- Bot meng-attach file **XRAY ACCOUNT DETAIL (.txt)**",
-      ].join("\n")
-    );
-    return e;
-  }
-
-  if (tab === "del") {
-    e.setDescription(
-      [
-        "**/del** (admin only)",
-        "",
-        "Mode list (recommended):",
-        "1) Jalankan `/del`",
-        "2) (Opsional) klik tombol filter protocol",
-        "3) Pilih akun dari dropdown",
-        "4) Konfirmasi delete (Confirm / Cancel)",
-        "",
-        "Mode direct confirm:",
-        "- `/del protocol:<vless|vmess|trojan|allproto> username:<name>`",
-      ].join("\n")
-    );
-    return e;
-  }
-
-  if (tab === "ping") {
-    e.setDescription(
-      [
-        "**/ping**",
-        "",
-        "Menampilkan health check bot dan latency IPC ke backend (ms).",
-      ].join("\n")
-    );
-    return e;
-  }
-
-  if (tab === "status") {
-    e.setDescription(
-      [
-        "**/status** (admin only)",
-        "",
-        "Menampilkan status service:",
-        "- Xray",
-        "- Nginx",
-        "",
-        "Serta latency IPC ke backend (ms).",
-      ].join("\n")
-    );
-    return e;
-  }
-
-  e.setDescription("Help tab not found.");
-  return e;
+  modal.addComponents(new ActionRowBuilder().addComponents(minutesInput));
+  return modal;
 }
 
 async function buildListMessage(kind, protoFilter, offset) {
@@ -447,7 +566,6 @@ async function buildListMessage(kind, protoFilter, offset) {
           const e = String(it.expired_at || "-");
           return {
             label: `${idx + 1}. ${u}`.slice(0, 100),
-            // dropdown masih menampilkan info tambahan biar mudah pilih (ini bukan "table")
             description: `${p} | exp ${e}`.slice(0, 100),
             value: u.slice(0, 100)
           };
@@ -511,6 +629,8 @@ async function registerCommands() {
     new SlashCommandBuilder().setName("ping").setDescription("Health check bot + backend latency (ms)"),
     new SlashCommandBuilder().setName("status").setDescription("Status service Xray dan Nginx (admin only)"),
 
+    new SlashCommandBuilder().setName("notify").setDescription("Panel notifikasi berkala Ping+Status (admin only)"),
+
     new SlashCommandBuilder()
       .setName("accounts")
       .setDescription("List akun + ambil ulang XRAY ACCOUNT DETAIL (.txt) (admin only)"),
@@ -549,25 +669,55 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 client.once("ready", () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  loadNotifyCfg();
+  startNotifyScheduler(client);
 });
 
 client.on("interactionCreate", async (interaction) => {
 
   // --------------------
-  // MODALS (for /add)
+  // MODALS
   // --------------------
   if (interaction.isModalSubmit()) {
     try {
       if (String(interaction.guildId) !== String(GUILD_ID)) {
         return interaction.reply({ content: "❌ Wrong guild", ephemeral: true });
       }
-      if (!isAdmin(interaction.member)) {
-        return interaction.reply({ content: "❌ Unauthorized", ephemeral: true });
-      }
 
       const cid = String(interaction.customId || "");
+
+      // notify interval modal
+      if (cid === "notify:interval_modal") {
+        if (!isAdmin(interaction.member)) {
+          return interaction.reply({ content: "❌ Unauthorized", ephemeral: true });
+        }
+
+        const raw = String(interaction.fields.getTextInputValue("minutes") || "").trim();
+        const minutes = parseInt(raw, 10);
+        if (!Number.isInteger(minutes) || minutes < NOTIFY_MIN_INTERVAL_MIN || minutes > NOTIFY_MAX_INTERVAL_MIN) {
+          return interaction.reply({
+            content: `❌ Interval tidak valid. Masukkan angka ${NOTIFY_MIN_INTERVAL_MIN}..${NOTIFY_MAX_INTERVAL_MIN}.`,
+            ephemeral: true
+          });
+        }
+
+        notifyCfg.interval_min = minutes;
+        notifyCfg.last_error = null;
+        saveNotifyCfg();
+        startNotifyScheduler(client);
+
+        const panel = buildNotifyPanel();
+        return interaction.reply({ ...panel, ephemeral: true });
+      }
+
+      // add modal
       if (!cid.startsWith("addmodal:")) {
         return interaction.reply({ content: "❌ Unknown modal", ephemeral: true });
+      }
+
+      if (!isAdmin(interaction.member)) {
+        return interaction.reply({ content: "❌ Unauthorized", ephemeral: true });
       }
 
       const protocol = cid.split(":")[1] || "";
@@ -597,7 +747,6 @@ client.on("interactionCreate", async (interaction) => {
       const finalEmail = resp.username;
       const secret = resp.password || resp.uuid || "(hidden)";
       const detailPath = resp.detail_path;
-      const jsonPath = resp.detail_json_path;
 
       const embed = new EmbedBuilder()
         .setTitle("✅ Created")
@@ -608,9 +757,8 @@ client.on("interactionCreate", async (interaction) => {
           { name: "UUID/Pass", value: `\`${secret}\``, inline: false },
           { name: "Valid Until", value: resp.expired_at || "-", inline: true },
           { name: "Quota", value: `${quota_gb} GB`, inline: true },
-          { name: "Metadata JSON", value: jsonPath ? `\`${jsonPath}\`` : "-", inline: false },
         )
-        .setFooter({ text: "Button: Resend Detail TXT untuk ambil ulang file .txt" });
+        .setFooter({ text: "Klik tombol untuk ambil ulang file .txt" });
 
       const files = [];
       if (detailPath && fs.existsSync(detailPath)) {
@@ -634,8 +782,40 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   // --------------------
-  // SELECT MENUS (admin only)
+  // SELECT MENUS
   // --------------------
+  if (interaction.isChannelSelectMenu && interaction.isChannelSelectMenu()) {
+    try {
+      if (String(interaction.guildId) !== String(GUILD_ID)) {
+        return interaction.reply({ content: "❌ Wrong guild", ephemeral: true });
+      }
+      if (!isAdmin(interaction.member)) {
+        return interaction.reply({ content: "❌ Unauthorized", ephemeral: true });
+      }
+
+      const cid = String(interaction.customId || "");
+      if (cid !== "notify:channel_select") {
+        return interaction.reply({ content: "❌ Unknown menu", ephemeral: true });
+      }
+
+      const selected = interaction.values && interaction.values[0] ? String(interaction.values[0]) : null;
+      if (!selected) {
+        return interaction.reply({ content: "❌ Tidak ada channel dipilih.", ephemeral: true });
+      }
+
+      notifyCfg.channel_id = selected;
+      notifyCfg.last_error = null;
+      saveNotifyCfg();
+      startNotifyScheduler(client);
+
+      const panel = buildNotifyPanel();
+      return interaction.update({ ...panel });
+    } catch (e) {
+      console.error(e);
+      return interaction.reply({ content: `❌ ${mapBackendError(e)}`, ephemeral: true });
+    }
+  }
+
   if (interaction.isStringSelectMenu()) {
     try {
       if (String(interaction.guildId) !== String(GUILD_ID)) {
@@ -727,21 +907,111 @@ client.on("interactionCreate", async (interaction) => {
 
       const customId = String(interaction.customId || "");
 
-      // /help tabs — allowed for everyone
-      if (customId.startsWith("help:tab:")) {
-        const tab = customId.split(":")[2] || "overview";
-        const embed = buildHelpEmbed(tab);
-        const row = buildHelpTabRow(tab);
-        return interaction.update({ content: null, embeds: [embed], components: [row] });
+      // /notify buttons (admin only)
+      if (customId.startsWith("notify:")) {
+        if (!isAdmin(interaction.member)) {
+          return interaction.reply({ content: "❌ Unauthorized", ephemeral: true });
+        }
+
+        // refresh panel
+        if (customId === "notify:refresh") {
+          await interaction.deferUpdate();
+          const panel = buildNotifyPanel();
+          return interaction.editReply({ ...panel });
+        }
+
+        // set channel -> show channel select menu
+        if (customId === "notify:set_channel") {
+          const extraRow = buildNotifyChannelSelectRow();
+          const panel = buildNotifyPanel({ extraRow });
+          return interaction.update({ ...panel });
+        }
+
+        // set interval -> modal
+        if (customId === "notify:set_interval") {
+          const modal = buildNotifyIntervalModal();
+          return interaction.showModal(modal);
+        }
+
+        // toggle enable/disable
+        if (customId === "notify:toggle") {
+          await interaction.deferUpdate();
+
+          if (!notifyCfg.enabled) {
+            // enabling requires channel set
+            if (!notifyCfg.channel_id) {
+              notifyCfg.last_error = "Channel belum diatur. Klik Set Channel terlebih dahulu.";
+              saveNotifyCfg();
+              const panel = buildNotifyPanel();
+              await interaction.editReply({ ...panel });
+              return interaction.followUp({ content: "❌ Channel belum diatur. Klik **Set Channel** dulu.", ephemeral: true });
+            }
+
+            notifyCfg.enabled = true;
+            notifyCfg.last_error = null;
+            saveNotifyCfg();
+            startNotifyScheduler(client);
+
+            const panel = buildNotifyPanel();
+            await interaction.editReply({ ...panel });
+            return interaction.followUp({ content: "✅ Notify diaktifkan. Gunakan **Test Now** untuk kirim 1x sekarang.", ephemeral: true });
+          }
+
+          // disabling
+          notifyCfg.enabled = false;
+          saveNotifyCfg();
+          stopNotifyScheduler();
+
+          const panel = buildNotifyPanel();
+          await interaction.editReply({ ...panel });
+          return interaction.followUp({ content: "✅ Notify dimatikan.", ephemeral: true });
+        }
+
+        // test now
+        if (customId === "notify:test") {
+          await interaction.deferUpdate();
+
+          if (!notifyCfg.channel_id) {
+            notifyCfg.last_error = "Channel belum diatur. Klik Set Channel terlebih dahulu.";
+            saveNotifyCfg();
+            const panel = buildNotifyPanel();
+            await interaction.editReply({ ...panel });
+            return interaction.followUp({ content: "❌ Channel belum diatur. Klik **Set Channel** dulu.", ephemeral: true });
+          }
+
+          // send 1x now (even if disabled)
+          await sendNotifyTick(client).catch((e) => {
+            notifyCfg.last_error = mapBackendError(e);
+            saveNotifyCfg();
+          });
+
+          const panel = buildNotifyPanel();
+          await interaction.editReply({ ...panel });
+          return interaction.followUp({ content: "✅ Test dikirim (cek channel target).", ephemeral: true });
+        }
+
+        return interaction.reply({ content: "❌ Unknown notify action", ephemeral: true });
       }
 
-      // Everything else requires admin
-      if (!isAdmin(interaction.member)) {
-        return interaction.reply({ content: "❌ Unauthorized", ephemeral: true });
+      // /help tabs are unchanged (if you use them elsewhere); keep minimal stable behavior
+      // ✅ /add protocol selector buttons
+      if (customId.startsWith("addproto:")) {
+        if (!isAdmin(interaction.member)) {
+          return interaction.reply({ content: "❌ Unauthorized", ephemeral: true });
+        }
+        const protocol = customId.split(":")[1] || "";
+        if (!ADD_PROTOCOLS.includes(protocol)) {
+          return interaction.reply({ content: "❌ Invalid protocol", ephemeral: true });
+        }
+        const modal = buildAddModal(protocol);
+        return interaction.showModal(modal);
       }
 
       // Protocol filter buttons for /accounts & /del list
       if (customId.startsWith("filt:")) {
+        if (!isAdmin(interaction.member)) {
+          return interaction.reply({ content: "❌ Unauthorized", ephemeral: true });
+        }
         const parts = customId.split(":");
         if (parts.length !== 3) return interaction.reply({ content: "❌ Invalid filter button", ephemeral: true });
 
@@ -766,18 +1036,11 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
-      // /add protocol selector buttons
-      if (customId.startsWith("addproto:")) {
-        const protocol = customId.split(":")[1] || "";
-        if (!ADD_PROTOCOLS.includes(protocol)) {
-          return interaction.reply({ content: "❌ Invalid protocol", ephemeral: true });
-        }
-        const modal = buildAddModal(protocol);
-        return interaction.showModal(modal);
-      }
-
       // paging buttons for accounts/delete lists (Prev/Next only)
       if (customId.startsWith("acct:") || customId.startsWith("del:")) {
+        if (!isAdmin(interaction.member)) {
+          return interaction.reply({ content: "❌ Unauthorized", ephemeral: true });
+        }
         const parts = customId.split(":");
         if (parts.length !== 4) return interaction.reply({ content: "❌ Invalid button", ephemeral: true });
 
@@ -808,6 +1071,9 @@ client.on("interactionCreate", async (interaction) => {
 
       // detail:<proto>:<finalEmail>
       if (customId.startsWith("detail:")) {
+        if (!isAdmin(interaction.member)) {
+          return interaction.reply({ content: "❌ Unauthorized", ephemeral: true });
+        }
         const parts = customId.split(":");
         if (parts.length !== 3) return interaction.reply({ content: "❌ Invalid button", ephemeral: true });
 
@@ -838,6 +1104,9 @@ client.on("interactionCreate", async (interaction) => {
 
       // delconfirm:<proto>:<username>  / delcancel:<proto>:<username>
       if (customId.startsWith("delconfirm:") || customId.startsWith("delcancel:")) {
+        if (!isAdmin(interaction.member)) {
+          return interaction.reply({ content: "❌ Unauthorized", ephemeral: true });
+        }
         const parts = customId.split(":");
         if (parts.length !== 3) return interaction.reply({ content: "❌ Invalid button", ephemeral: true });
 
@@ -881,6 +1150,9 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 
+  // --------------------
+  // SLASH COMMANDS
+  // --------------------
   if (!interaction.isChatInputCommand()) return;
 
   if (String(interaction.guildId) !== String(GUILD_ID)) {
@@ -889,14 +1161,26 @@ client.on("interactionCreate", async (interaction) => {
 
   const cmd = interaction.commandName;
 
-  // /help
   if (cmd === "help") {
-    const embed = buildHelpEmbed("overview");
-    const row = buildHelpTabRow("overview");
-    return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+    const embed = new EmbedBuilder()
+      .setTitle("📘 XRAY Discord Bot Help")
+      .setDescription("Bot ini untuk manajemen akun Xray via backend service (IPC).")
+      .addFields(
+        { name: "/add", value: "Buat akun: pilih protocol via button, lalu isi form (username/days/quota). **Admin only**", inline: false },
+        { name: "/del", value: "Hapus akun via list+pilih+confirm. Atau isi protocol+username untuk confirm langsung. **Admin only**", inline: false },
+        { name: "/accounts", value: "List akun (paging) + pilih untuk ambil ulang detail (.txt). **Admin only**", inline: false },
+        { name: "/notify", value: "Panel notifikasi berkala Ping+Status (set channel, interval, enable/disable). **Admin only**", inline: false },
+        { name: "/ping", value: "Cek bot hidup + latency backend (ms).", inline: false },
+        { name: "/status", value: "Lihat status service Xray & Nginx. **Admin only**", inline: false },
+        { name: "Aturan username", value: "`[A-Za-z0-9_]` (tanpa suffix). Bot akan menambahkan `@vless/@vmess/@trojan/@allproto`.", inline: false },
+        { name: "Quota", value: "`quota_gb=0` berarti Unlimited.", inline: false }
+      )
+      .setFooter({ text: "Tip: Jika error socket/backend, cek /status (admin) atau journalctl xray-backend." });
+
+    return interaction.reply({ embeds: [embed], ephemeral: true });
   }
 
-  // /ping content-only
+  // /ping (content-only)
   if (cmd === "ping") {
     try {
       const wsMs = Math.round(client.ws.ping);
@@ -937,7 +1221,7 @@ client.on("interactionCreate", async (interaction) => {
     return interaction.reply({ content: "❌ Unauthorized (admin role required).", ephemeral: true });
   }
 
-  // /status content-only
+  // /status (content-only)
   if (cmd === "status") {
     try {
       const t0 = Date.now();
@@ -972,7 +1256,13 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 
-  // /accounts embed-only list
+  // /notify -> open panel
+  if (cmd === "notify") {
+    const panel = buildNotifyPanel();
+    return interaction.reply({ ...panel, ephemeral: true });
+  }
+
+  // /accounts
   if (cmd === "accounts") {
     try {
       await interaction.deferReply({ ephemeral: true });
@@ -990,7 +1280,7 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 
-  // /add starts protocol selection with buttons
+  // /add
   if (cmd === "add") {
     const row = buildAddProtocolButtons();
     const msg =
