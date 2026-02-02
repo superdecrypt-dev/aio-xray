@@ -198,39 +198,68 @@ def _read_domain_from_nginx_conf() -> str:
 
 def _read_public_port_from_nginx_conf(default: int = 443) -> int:
     """
-    Ambil port publik dari /etc/nginx/conf.d/xray.conf dengan parse directive 'listen'.
-    Fallback ke 443 jika tidak ditemukan.
+    Ambil port publik dari /etc/nginx/conf.d/xray.conf dengan prioritas:
+      1) directive 'listen ... ssl;' (TLS public)
+      2) directive 'listen ...;' non-ssl
+    Fallback ke default jika tidak ditemukan.
+
     Contoh yang didukung:
       listen 443 ssl;
       listen [::]:443 ssl;
       listen 0.0.0.0:443 ssl http2;
+      listen 80;
+      listen [::]:80;
     """
     conf = Path("/etc/nginx/conf.d/xray.conf")
     if not conf.exists():
         return default
 
+    def _extract_port(listen_value: str) -> Optional[int]:
+        s = listen_value.strip()
+
+        # Ambil port setelah ":" dulu (ipv4/ipv6 bind)
+        m = re.search(r":(\d{2,5})\b", s)
+        if m:
+            p = int(m.group(1))
+            if 1 <= p <= 65535:
+                return p
+
+        # Kalau tidak ada ":" ambil angka pertama
+        m2 = re.search(r"\b(\d{2,5})\b", s)
+        if m2:
+            p = int(m2.group(1))
+            if 1 <= p <= 65535:
+                return p
+
+        return None
+
     try:
         txt = conf.read_text(encoding="utf-8", errors="ignore")
-        # cari semua "listen ...;"
         listens = re.findall(r"^\s*listen\s+([^;]+);", txt, flags=re.M)
-        for l in listens:
-            s = l.strip()
 
-            # buang token non-port yang umum muncul
-            # contoh: "443 ssl http2" / "[::]:443 ssl" / "0.0.0.0:443 ssl"
-            # cari port setelah ":" dulu (ipv6/ipv4 bind)
-            m = re.search(r":(\d{2,5})\b", s)
-            if m:
-                port = int(m.group(1))
-                if 1 <= port <= 65535:
-                    return port
+        ssl_ports: List[int] = []
+        nonssl_ports: List[int] = []
 
-            # kalau tidak ada ":" ambil token angka pertama
-            m2 = re.search(r"\b(\d{2,5})\b", s)
-            if m2:
-                port = int(m2.group(1))
-                if 1 <= port <= 65535:
-                    return port
+        for lv in listens:
+            port = _extract_port(lv)
+            if port is None:
+                continue
+
+            # deteksi ssl token pada listen directive
+            is_ssl = re.search(r"\bssl\b", lv) is not None
+            if is_ssl:
+                ssl_ports.append(port)
+            else:
+                nonssl_ports.append(port)
+
+        # Prioritas: listen ... ssl;
+        if ssl_ports:
+            return ssl_ports[0]
+
+        # Fallback: listen non-ssl pertama (mis. 80)
+        if nonssl_ports:
+            return nonssl_ports[0]
+
     except Exception:
         pass
 
