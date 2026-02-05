@@ -1057,7 +1057,7 @@ function generate_configs() {
         "type": "field",
         "outboundTag": "blocked",
         "user": [
-           "dummy-user"
+           "dummy-block-user"
         ]
       },
       {
