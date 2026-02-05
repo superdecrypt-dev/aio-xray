@@ -571,7 +571,8 @@ run_step "5. Menyiapkan Direktori & Permission Log" setup_dirs
 function setup_ssl() {
     RANDOM_EMAIL="$(tr -dc a-z0-9 </dev/urandom | head -c 10)@gmail.com"
     curl https://get.acme.sh | sh -s email=$RANDOM_EMAIL
-    /root/.acme.sh/acme.sh --set-default-ca --server zerossl
+    /root/.acme.sh/acme.sh --upgrade
+    /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
 
     if [[ "$DOMAIN_MODE" == "custom" ]]; then
         # --- MODE 1: CUSTOM DOMAIN (Standalone) ---
