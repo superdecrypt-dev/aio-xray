@@ -201,8 +201,8 @@ while true; do
         # Host Selection Loop
         while true; do
             echo -e "\n   ${YELLOW}Pilih Domain Induk:${NC}"
-            echo -e "   1. vyxara1.qzz.io"
-            echo -e "   2. vyxara2.qzz.io"
+            echo -e "   1. vyxara1.web.id"
+            echo -e "   2. vyxara2.web.id"
             echo -e "   0. Kembali ke Menu Utama"
             read -p "   Pilih (0-2): " CF_HOST_OPT
 
@@ -215,8 +215,8 @@ while true; do
             ROOT_ZONE=""
 
             case $CF_HOST_OPT in
-            1) BASE_DOMAIN="vyxara1.qzz.io" ;;
-            2) BASE_DOMAIN="vyxara2.qzz.io" ;;
+            1) BASE_DOMAIN="vyxara1.web.id" ;;
+            2) BASE_DOMAIN="vyxara2.web.id" ;;
             *)
                 echo -e "   ${RED}Pilihan tidak valid!${NC}"
                 continue
